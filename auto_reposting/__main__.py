@@ -2,15 +2,16 @@ import asyncio
 import random
 import subprocess
 from datetime import datetime
-
 from loguru import logger
 from telethon import TelegramClient
-from telethon.errors import UserAlreadyParticipantError
+from telethon.errors import UserAlreadyParticipantError, FloodWaitError
+from telethon.errors.rpcerrorlist import FloodWaitError as FloodWaitError2
 from telethon.events import NewMessage
 from telethon.tl.functions.channels import JoinChannelRequest
 
 from core.models import tg_account as tg_account_db, channel as channel_db
 from auto_reposting import telegram_utils, telegram_utils2
+from auto_pause_restorer import start_pause_restorer, stop_pause_restorer, pause_restorer
 from core.settings import json_settings
 
 log_file_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".log"
@@ -84,11 +85,22 @@ async def get_working_client() -> tuple[TelegramClient, tg_account_db.TGAccount]
 async def main() -> None:
     logger.info("Запущен бот для отслеживания постов с каналов...")
     
+    # Запускаем автовосстановление пауз как фоновую задачу
+    pause_restorer_task = None
+    try:
+        logger.info("🔄 Запуск автовосстановления пауз...")
+        pause_restorer_task = asyncio.create_task(start_pause_restorer())
+        logger.success("✅ Автовосстановление пауз запущено")
+    except Exception as e:
+        logger.error(f"Ошибка при запуске автовосстановления: {e}")
+    
     # Получаем рабочий клиент
     random_telegram_client, random_tg_account = await get_working_client()
     
     if random_telegram_client is None:
         logger.error("Нет доступных аккаунтов для работы. Ожидание 5 минут...")
+        if pause_restorer_task:
+            pause_restorer_task.cancel()
         await asyncio.sleep(300)
         return
     
@@ -150,6 +162,16 @@ async def main() -> None:
     except Exception as e:
         logger.error(f"Ошибка в основном цикле: {e}")
     finally:
+        # Останавливаем автовосстановление
+        if pause_restorer_task:
+            logger.info("🛑 Остановка автовосстановления пауз...")
+            stop_pause_restorer()
+            try:
+                await asyncio.wait_for(pause_restorer_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning("Таймаут при остановке автовосстановления")
+                pause_restorer_task.cancel()
+        
         # Обязательно закрываем соединение
         if random_telegram_client and random_telegram_client.is_connected():
             try:
