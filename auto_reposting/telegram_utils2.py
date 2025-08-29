@@ -131,7 +131,7 @@ async def checking_and_joining_if_possible(telegram_client: TelegramClient, url:
                 group = await telegram_client.get_entity(url)
             except (errors.UsernameNotOccupiedError, errors.ChannelPrivateError, errors.ChannelInvalidError, ValueError) as e:
                 logger.error(f"Группа {url} недоступна: {type(e).__name__} - {e}")
-                await group_db.delete_group_by_url(channel_guid=channel.guid, url=url)
+                #await group_db.delete_group_by_url(channel_guid=channel.guid, url=url)
                 return False
             except Exception as e:
                 logger.error(f"Неожиданная ошибка при получении группы {url}: {e}")
@@ -146,7 +146,7 @@ async def checking_and_joining_if_possible(telegram_client: TelegramClient, url:
                 return True
             except (errors.UsernameNotOccupiedError, errors.ChannelPrivateError, errors.ChannelInvalidError, ValueError) as e:
                 logger.error(f"Не могу присоединиться к группе {url}: {type(e).__name__} - {e}")
-                await group_db.delete_group_by_url(channel_guid=channel.guid, url=url)
+                #await group_db.delete_group_by_url(channel_guid=channel.guid, url=url)
                 return False
             except errors.InviteRequestSentError:
                 logger.info(f"Отправлен запрос на вступление в группу {url}")
