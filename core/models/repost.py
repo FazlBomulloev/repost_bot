@@ -19,7 +19,7 @@ class Repost(Base):
 
 async def create_repost(repost_in: repost_schemas.RepostCreate) -> Repost:
     async with async_session_maker() as session:
-        group = Repost(**repost_in.model_dump())
+        group = Repost(repost_in.model_dump())
         session.add(group)
         await session.commit()
         return group

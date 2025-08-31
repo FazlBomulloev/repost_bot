@@ -14,6 +14,17 @@ from core.models import tg_account as tg_account_db, channel as channel_db, grou
 from core.settings import json_settings, settings
 
 
+async def cleanup_clients(clients_to_cleanup: List[TelegramClient]) -> None:
+    """ОБЯЗАТЕЛЬНО отключает все переданные клиенты"""
+    for client in clients_to_cleanup:
+        if client:
+            try:
+                await client.disconnect()
+                logger.debug("🔌 Клиент отключен")
+            except Exception as e:
+                logger.debug(f"Ошибка при отключении клиента: {e}")
+
+
 async def check_stop_link_in_message(
         tg_accounts: List[tg_account_db.TGAccount],
         telegram_client: TelegramClient,
@@ -59,234 +70,248 @@ async def process_group_reposting(
         groups: List[group_db.Group],
         telegram_message_id: int
 ) -> None:
-    # Фильтруем только рабочие аккаунты
-    working_accounts = [acc for acc in tg_accounts if acc.status == "WORKING"]
-    if not working_accounts:
-        await telegram_utils.send_message(
-            chat_id=settings.admin_chat_id, 
-            text=f"У канала {channel.url} нет рабочих аккаунтов."
-        )
-        return
-
-    logger.info(f"Найдено {len(working_accounts)} рабочих аккаунтов для канала {channel.url}")
-
-    # Получаем настройки
-    try:
-        number_reposts_before_pause = await json_settings.async_get_attribute("number_reposts_before_pause")
-        pause_after_rate_reposts = await json_settings.async_get_attribute("pause_after_rate_reposts")
-        pause_between_reposts = await json_settings.async_get_attribute("pause_between_reposts")
-    except Exception as e:
-        logger.error(f"Ошибка при получении настроек: {e}")
-        # Устанавливаем значения по умолчанию
-        number_reposts_before_pause = 10
-        pause_after_rate_reposts = 3600
-        pause_between_reposts = 60
-
-    account_index = 0
-    telegram_client = None
+    """Основная функция репостинга - БЕЗ ИЗМЕНЕНИЙ логики, только добавлено правильное закрытие клиентов"""
+    
+    # Список всех клиентов для гарантированного закрытия
+    all_clients_used = []
     
     try:
-        # Получаем первый рабочий клиент
-        telegram_client, account_index = await telegram_utils2.get_authorized_tg_client_with_check_pause(
-            accounts=working_accounts,
-            start_index=account_index
-        )
-    except exc.NoAccounts:
-        await telegram_utils.send_message(
-            chat_id=settings.admin_chat_id, 
-            text=f"У канала {channel.url} нет доступных аккаунтов для работы."
-        )
-        return
-
-    # Проверяем стоп-ссылки
-    try:
-        if await check_stop_link_in_message(
-            tg_accounts=working_accounts, 
-            telegram_client=telegram_client, 
-            channel_url=channel.url,
-            telegram_channel_id=channel.telegram_channel_id,
-            telegram_message_id=telegram_message_id
-        ):
-            return
-    except Exception as e:
-        logger.error(f"Ошибка при проверке стоп-ссылок: {e}")
-
-    counter_number_reposts_before_pause = 0
-    successful_reposts = 0
-
-    for group_index, group in enumerate(groups):
-        logger.info(f"Обрабатываю группу {group_index + 1}/{len(groups)}: {group.url}")
-
-        # Проверяем, нужна ли смена аккаунта
-        if counter_number_reposts_before_pause >= number_reposts_before_pause:
-            logger.info(f"Достигнут лимит репостов ({number_reposts_before_pause}), меняю аккаунт")
-            
-            # Ставим текущий аккаунт на паузу
-            current_account = working_accounts[account_index]
-            await tg_account_db.add_pause(
-                tg_account=current_account,
-                pause_in_seconds=pause_after_rate_reposts
+        # Фильтруем только рабочие аккаунты
+        working_accounts = [acc for acc in tg_accounts if acc.status == "WORKING"]
+        if not working_accounts:
+            await telegram_utils.send_message(
+                chat_id=settings.admin_chat_id, 
+                text=f"У канала {channel.url} нет рабочих аккаунтов."
             )
-            logger.info(f"Аккаунт +{current_account.phone_number} поставлен на паузу на {pause_after_rate_reposts} секунд")
+            return
 
-            # Закрываем текущий клиент
-            if telegram_client:
-                try:
-                    await telegram_client.disconnect()
-                except:
-                    pass
-                telegram_client = None
+        logger.info(f"Найдено {len(working_accounts)} рабочих аккаунтов для канала {channel.url}")
 
-            # Получаем следующий аккаунт
-            account_index += 1
-            try:
-                telegram_client, account_index = await telegram_utils2.get_authorized_tg_client_with_check_pause(
-                    accounts=working_accounts,
-                    start_index=account_index
-                )
-                counter_number_reposts_before_pause = 0
-            except exc.NoAccounts:
-                logger.warning("Закончились доступные аккаунты")
-                await telegram_utils.send_message(
-                    chat_id=settings.admin_chat_id, 
-                    text=f"У канала {channel.url} закончились аккаунты. Обработано {successful_reposts} репостов."
-                )
-                return
-
-        # Пытаемся вступить в группу
-        max_join_attempts = 3
-        join_successful = False
-        
-        for join_attempt in range(max_join_attempts):
-            try:
-                join_successful = await telegram_utils2.checking_and_joining_if_possible(
-                    telegram_client=telegram_client,
-                    url=group.url,
-                    channel=channel
-                )
-                if join_successful:
-                    break
-                    
-            except errors.FloodWaitError:
-                logger.warning(f"FloodWait при попытке вступить в группу {group.url}, попытка {join_attempt + 1}")
-                if join_attempt < max_join_attempts - 1:
-                    # Пытаемся сменить аккаунт
-                    if telegram_client:
-                        try:
-                            await telegram_client.disconnect()
-                        except:
-                            pass
-                        telegram_client = None
-
-                    account_index += 1
-                    try:
-                        telegram_client, account_index = await telegram_utils2.get_authorized_tg_client_with_check_pause(
-                            accounts=working_accounts,
-                            start_index=account_index
-                        )
-                    except exc.NoAccounts:
-                        logger.warning("Нет доступных аккаунтов для смены")
-                        return
-                else:
-                    logger.error(f"Не удалось вступить в группу {group.url} после {max_join_attempts} попыток")
-                    break
-            except Exception as e:
-                logger.error(f"Ошибка при вступлении в группу {group.url}: {e}")
-                break
-
-        if not join_successful:
-            logger.info(f"Пропускаю группу {group.url} - не удалось вступить")
-            continue
-
-        # Пытаемся сделать репост
-        max_repost_attempts = 3
-        repost_successful = False
-
-        for repost_attempt in range(max_repost_attempts):
-            try:
-                repost_successful = await telegram_utils2.repost_in_group_by_message_id(
-                    message_id=telegram_message_id,
-                    telegram_client=telegram_client,
-                    telegram_channel_id=channel.telegram_channel_id,
-                    channel_url=channel.url,
-                    group_url=group.url
-                )
-                
-                if repost_successful:
-                    # Записываем успешный репост в базу
-                    await repost_db.create_repost(
-                        repost_in=repost_schemas.RepostCreate(
-                            channel_guid=channel.guid,
-                            repost_message_id=telegram_message_id,
-                            created_at=datetime.now().date()
-                        )
-                    )
-                    logger.info(f"Успешно сделан репост в группу {group.url}")
-                    counter_number_reposts_before_pause += 1
-                    successful_reposts += 1
-                    
-                    # Пауза между репостами
-                    if pause_between_reposts > 0:
-                        await asyncio.sleep(pause_between_reposts)
-                    break
-                else:
-                    logger.warning(f"Репост в группу {group.url} не удался, попытка {repost_attempt + 1}")
-
-            except errors.FloodWaitError:
-                logger.warning(f"FloodWait при репосте в группу {group.url}, попытка {repost_attempt + 1}")
-                if repost_attempt < max_repost_attempts - 1:
-                    # Пытаемся сменить аккаунт
-                    try:
-                        await telegram_utils.check_ban_in_spambot(telegram_client=telegram_client)
-                    except Exception as e:
-                        logger.error(f"Ошибка при проверке на спам: {e}")
-
-                    if telegram_client:
-                        try:
-                            await telegram_client.disconnect()
-                        except:
-                            pass
-                        telegram_client = None
-
-                    account_index += 1
-                    try:
-                        telegram_client, account_index = await telegram_utils2.get_authorized_tg_client_with_check_pause(
-                            accounts=working_accounts,
-                            start_index=account_index
-                        )
-                    except exc.NoAccounts:
-                        logger.warning("Нет доступных аккаунтов для смены при FloodWait")
-                        return
-                else:
-                    logger.error(f"Не удалось сделать репост в группу {group.url} после {max_repost_attempts} попыток")
-                    break
-
-            except (errors.ChatWriteForbiddenError, errors.UserBannedInChannelError) as e:
-                logger.error(f"Репост в группу {group.url} невозможен - бан или ограничения: {e}")
-                break
-
-            except Exception as e:
-                logger.error(f"Ошибка при репосте в группу {group.url}: {e}")
-                if repost_attempt < max_repost_attempts - 1:
-                    await asyncio.sleep(5)  # Небольшая пауза перед повтором
-                else:
-                    logger.error(f"Не удалось сделать репост в группу {group.url} после {max_repost_attempts} попыток")
-
-        if not repost_successful:
-            logger.info(f"Не удалось сделать репост в группу {group.url}")
-
-    # Закрываем клиент в конце
-    if telegram_client:
+        # Получаем настройки
         try:
-            await telegram_client.disconnect()
-        except:
-            pass
+            number_reposts_before_pause = await json_settings.async_get_attribute("number_reposts_before_pause")
+            pause_after_rate_reposts = await json_settings.async_get_attribute("pause_after_rate_reposts")
+            pause_between_reposts = await json_settings.async_get_attribute("pause_between_reposts")
+        except Exception as e:
+            logger.error(f"Ошибка при получении настроек: {e}")
+            # Устанавливаем значения по умолчанию
+            number_reposts_before_pause = 10
+            pause_after_rate_reposts = 3600
+            pause_between_reposts = 60
 
-    logger.info(f"Обработка канала {channel.url} завершена. Успешных репостов: {successful_reposts}")
+        account_index = 0
+        telegram_client = None
+        
+        try:
+            # Получаем первый рабочий клиент
+            telegram_client, account_index = await telegram_utils2.get_authorized_tg_client_with_check_pause(
+                accounts=working_accounts,
+                start_index=account_index
+            )
+            if telegram_client:
+                all_clients_used.append(telegram_client)
+                
+        except exc.NoAccounts:
+            await telegram_utils.send_message(
+                chat_id=settings.admin_chat_id, 
+                text=f"У канала {channel.url} нет доступных аккаунтов для работы."
+            )
+            return
+
+        # Проверяем стоп-ссылки
+        try:
+            if await check_stop_link_in_message(
+                tg_accounts=working_accounts, 
+                telegram_client=telegram_client, 
+                channel_url=channel.url,
+                telegram_channel_id=channel.telegram_channel_id,
+                telegram_message_id=telegram_message_id
+            ):
+                return
+        except Exception as e:
+            logger.error(f"Ошибка при проверке стоп-ссылок: {e}")
+
+        counter_number_reposts_before_pause = 0
+        successful_reposts = 0
+
+        for group_index, group in enumerate(groups):
+            logger.info(f"Обрабатываю группу {group_index + 1}/{len(groups)}: {group.url}")
+
+            # Проверяем, нужна ли смена аккаунта
+            if counter_number_reposts_before_pause >= number_reposts_before_pause:
+                logger.info(f"Достигнут лимит репостов ({number_reposts_before_pause}), меняю аккаунт")
+                
+                # Ставим текущий аккаунт на паузу
+                current_account = working_accounts[account_index]
+                await tg_account_db.add_pause(
+                    tg_account=current_account,
+                    pause_in_seconds=pause_after_rate_reposts
+                )
+                logger.info(f"Аккаунт +{current_account.phone_number} поставлен на паузу на {pause_after_rate_reposts} секунд")
+
+                # Закрываем текущий клиент
+                if telegram_client:
+                    try:
+                        await telegram_client.disconnect()
+                    except:
+                        pass
+                    telegram_client = None
+
+                # Получаем следующий аккаунт
+                account_index += 1
+                try:
+                    telegram_client, account_index = await telegram_utils2.get_authorized_tg_client_with_check_pause(
+                        accounts=working_accounts,
+                        start_index=account_index
+                    )
+                    if telegram_client:
+                        all_clients_used.append(telegram_client)
+                    counter_number_reposts_before_pause = 0
+                except exc.NoAccounts:
+                    logger.warning("Закончились доступные аккаунты")
+                    await telegram_utils.send_message(
+                        chat_id=settings.admin_chat_id, 
+                        text=f"У канала {channel.url} закончились аккаунты. Обработано {successful_reposts} репостов."
+                    )
+                    return
+
+            # Пытаемся вступить в группу
+            max_join_attempts = 3
+            join_successful = False
+            
+            for join_attempt in range(max_join_attempts):
+                try:
+                    join_successful = await telegram_utils2.checking_and_joining_if_possible(
+                        telegram_client=telegram_client,
+                        url=group.url,
+                        channel=channel
+                    )
+                    if join_successful:
+                        break
+                        
+                except errors.FloodWaitError:
+                    logger.warning(f"FloodWait при попытке вступить в группу {group.url}, попытка {join_attempt + 1}")
+                    if join_attempt < max_join_attempts - 1:
+                        # Пытаемся сменить аккаунт
+                        if telegram_client:
+                            try:
+                                await telegram_client.disconnect()
+                            except:
+                                pass
+                            telegram_client = None
+
+                        account_index += 1
+                        try:
+                            telegram_client, account_index = await telegram_utils2.get_authorized_tg_client_with_check_pause(
+                                accounts=working_accounts,
+                                start_index=account_index
+                            )
+                            if telegram_client:
+                                all_clients_used.append(telegram_client)
+                        except exc.NoAccounts:
+                            logger.warning("Нет доступных аккаунтов для смены")
+                            return
+                    else:
+                        logger.error(f"Не удалось вступить в группу {group.url} после {max_join_attempts} попыток")
+                        break
+                except Exception as e:
+                    logger.error(f"Ошибка при вступлении в группу {group.url}: {e}")
+                    break
+
+            if not join_successful:
+                logger.info(f"Пропускаю группу {group.url} - не удалось вступить")
+                continue
+
+            # Пытаемся сделать репост
+            max_repost_attempts = 3
+            repost_successful = False
+
+            for repost_attempt in range(max_repost_attempts):
+                try:
+                    repost_successful = await telegram_utils2.repost_in_group_by_message_id(
+                        message_id=telegram_message_id,
+                        telegram_client=telegram_client,
+                        telegram_channel_id=channel.telegram_channel_id,
+                        channel_url=channel.url,
+                        group_url=group.url
+                    )
+                    
+                    if repost_successful:
+                        # Записываем успешный репост в базу
+                        await repost_db.create_repost(
+                            repost_in=repost_schemas.RepostCreate(
+                                channel_guid=channel.guid,
+                                repost_message_id=telegram_message_id,
+                                created_at=datetime.now().date()
+                            )
+                        )
+                        logger.info(f"Успешно сделан репост в группу {group.url}")
+                        counter_number_reposts_before_pause += 1
+                        successful_reposts += 1
+                        
+                        # Пауза между репостами
+                        if pause_between_reposts > 0:
+                            await asyncio.sleep(pause_between_reposts)
+                        break
+                    else:
+                        logger.warning(f"Репост в группу {group.url} не удался, попытка {repost_attempt + 1}")
+
+                except errors.FloodWaitError:
+                    logger.warning(f"FloodWait при репосте в группу {group.url}, попытка {repost_attempt + 1}")
+                    if repost_attempt < max_repost_attempts - 1:
+                        # Пытаемся сменить аккаунт
+                        try:
+                            await telegram_utils.check_ban_in_spambot(telegram_client=telegram_client)
+                        except Exception as e:
+                            logger.error(f"Ошибка при проверке на спам: {e}")
+
+                        if telegram_client:
+                            try:
+                                await telegram_client.disconnect()
+                            except:
+                                pass
+                            telegram_client = None
+
+                        account_index += 1
+                        try:
+                            telegram_client, account_index = await telegram_utils2.get_authorized_tg_client_with_check_pause(
+                                accounts=working_accounts,
+                                start_index=account_index
+                            )
+                            if telegram_client:
+                                all_clients_used.append(telegram_client)
+                        except exc.NoAccounts:
+                            logger.warning("Нет доступных аккаунтов для смены при FloodWait")
+                            return
+                    else:
+                        logger.error(f"Не удалось сделать репост в группу {group.url} после {max_repost_attempts} попыток")
+                        break
+
+                except (errors.ChatWriteForbiddenError, errors.UserBannedInChannelError) as e:
+                    logger.error(f"Репост в группу {group.url} невозможен - бан или ограничения: {e}")
+                    break
+
+                except Exception as e:
+                    logger.error(f"Ошибка при репосте в группу {group.url}: {e}")
+                    if repost_attempt < max_repost_attempts - 1:
+                        await asyncio.sleep(5)  # Небольшая пауза перед повтором
+                    else:
+                        logger.error(f"Не удалось сделать репост в группу {group.url} после {max_repost_attempts} попыток")
+
+            if not repost_successful:
+                logger.info(f"Не удалось сделать репост в группу {group.url}")
+
+        logger.info(f"Обработка канала {channel.url} завершена. Успешных репостов: {successful_reposts}")
+
+    finally:
+        # ОБЯЗАТЕЛЬНО закрываем ВСЕ использованные клиенты
+        logger.info(f"🔌 Закрываю {len(all_clients_used)} использованных клиентов...")
+        await cleanup_clients(all_clients_used)
+        logger.info("✅ Все клиенты закрыты")
 
 
 async def new_message_in_channel(telegram_channel_id: int, telegram_message_id: int) -> None:
-    """Обрабатывает новое сообщение в канале"""
+    """Обрабатывает новое сообщение в канале - ТОЧНО ТАКАЯ ЖЕ логика как раньше"""
     try:
         # Получаем канал из базы
         channel = await channel_db.get_channel_by_telegram_channel_id(telegram_channel_id=telegram_channel_id)
@@ -335,6 +360,7 @@ async def new_message_in_channel(telegram_channel_id: int, telegram_message_id: 
             pass
 
 
+# Точка входа для subprocess (сохраняем для совместимости, хотя больше не используется)
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--telegram_message_id', type=int, required=True, help='The ID of the message')

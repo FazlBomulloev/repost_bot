@@ -25,7 +25,7 @@ class TGAccount(Base):
 
 async def create_tg_account(tg_account_in: tg_account_schemas.TGAccountCreate) -> TGAccount:
     async with async_session_maker() as session:
-        tg_account = TGAccount(**tg_account_in.model_dump())
+        tg_account = TGAccount(tg_account_in.model_dump())
         session.add(tg_account)
         await session.commit()
         return tg_account
@@ -62,7 +62,7 @@ async def delete_tg_account(tg_account: TGAccount) -> None:
 
 async def update_tg_account(tg_account: TGAccount, tg_account_update: tg_account_schemas.TGAccountUpdate) -> TGAccount:
     async with async_session_maker() as session:
-        query = update(TGAccount).where(TGAccount.guid == tg_account.guid).values(**tg_account_update.model_dump(exclude_unset=True))
+        query = update(TGAccount).where(TGAccount.guid == tg_account.guid).values(tg_account_update.model_dump(exclude_unset=True))
         await session.execute(query)
         await session.commit()
     return tg_account

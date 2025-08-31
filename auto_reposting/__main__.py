@@ -1,9 +1,8 @@
 import asyncio
 import random
-import subprocess
 from datetime import datetime
 from loguru import logger
-from telethon import TelegramClient
+from telethon import TelegramClient, errors
 from telethon.errors import UserAlreadyParticipantError, FloodWaitError
 from telethon.errors.rpcerrorlist import FloodWaitError as FloodWaitError2
 from telethon.events import NewMessage
@@ -13,6 +12,7 @@ from core.models import tg_account as tg_account_db, channel as channel_db
 from auto_reposting import telegram_utils, telegram_utils2
 from auto_pause_restorer import start_pause_restorer, stop_pause_restorer, pause_restorer
 from core.settings import json_settings
+from auto_reposting.channel_processor import channel_processor
 
 log_file_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".log"
 
@@ -83,7 +83,24 @@ async def get_working_client() -> tuple[TelegramClient, tg_account_db.TGAccount]
 
 
 async def main() -> None:
-    logger.info("Запущен бот для отслеживания постов с каналов...")
+    logger.info("Запущен объединенный бот (управление + репостинг)...")
+    
+    # Запускаем Telegram бота для управления
+    from aiogram import Dispatcher
+    from app.handlers import setup_routes
+    from core.settings import bot
+    
+    dp = Dispatcher()
+    setup_routes(dp=dp)
+    
+    logger.info("🤖 Запуск Telegram бота для управления...")
+    bot_task = asyncio.create_task(dp.start_polling(bot))
+    logger.success("✅ Telegram бот запущен")
+    
+    # Запускаем процессор каналов (выделенный воркер на канал)
+    logger.info("🚀 Запуск процессора каналов...")
+    await channel_processor.start()
+    logger.success("✅ Процессор каналов запущен")
     
     # Запускаем автовосстановление пауз как фоновую задачу
     pause_restorer_task = None
@@ -101,6 +118,7 @@ async def main() -> None:
         logger.error("Нет доступных аккаунтов для работы. Ожидание 5 минут...")
         if pause_restorer_task:
             pause_restorer_task.cancel()
+        await message_processor.stop()
         await asyncio.sleep(300)
         return
     
@@ -137,21 +155,21 @@ async def main() -> None:
 
             logger.info(f"Получено новое сообщение CHANNEL ID: {channel_id} MESSAGE ID: {message_id}")
 
-            # Запускаем обработку в отдельном процессе
+            # Добавляем в очередь вместо запуска subprocess
             try:
-                command = [
-                    'venv/bin/python3',
-                    'process_post3.py',
-                    '--telegram_message_id',
-                    str(message_id),
-                    '--telegram_channel_id',
-                    str(channel_id),
-                    '--log_filename',
-                    log_file_name
-                ]
-                subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                success = await message_processor.add_message(channel_id, message_id)
+                
+                if success:
+                    logger.info(f"✅ Сообщение {message_id} добавлено в очередь")
+                    
+                    # Логируем статистику
+                    stats = message_processor.get_stats()
+                    logger.info(f"📊 Очередь: {stats['queue_size']}, Обработано всего: {stats['total_processed']}")
+                else:
+                    logger.warning(f"⚠️ Сообщение {message_id} не добавлено (дубль или переполнение)")
+                    
             except Exception as e:
-                logger.error(f"Ошибка при запуске процесса обработки: {e}")
+                logger.error(f"Ошибка при добавлении сообщения в очередь: {e}")
 
         # Подписываемся на каналы
         await check_subscribe_in_channels(client=random_telegram_client)
@@ -162,6 +180,19 @@ async def main() -> None:
     except Exception as e:
         logger.error(f"Ошибка в основном цикле: {e}")
     finally:
+        # Останавливаем Telegram бота
+        if 'bot_task' in locals() and not bot_task.done():
+            logger.info("🛑 Остановка Telegram бота...")
+            bot_task.cancel()
+            try:
+                await bot_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Останавливаем процессор сообщений
+        logger.info("🛑 Остановка процессора сообщений...")
+        await message_processor.stop()
+        
         # Останавливаем автовосстановление
         if pause_restorer_task:
             logger.info("🛑 Остановка автовосстановления пауз...")

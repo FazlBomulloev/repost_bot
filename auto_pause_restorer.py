@@ -120,12 +120,12 @@ class PauseRestorer:
             from core.settings import bot
             
             # Формируем сообщение
-            message = f"""🔄 **Автовосстановление аккаунтов**
+            message = f"""🔄 Автовосстановление аккаунтов
             
 ✅ Восстановлено: {restore_result['restored_accounts']} аккаунтов"""
             
             if restore_result['errors']:
-                message += f"\n\n⚠️ **Ошибки:** {len(restore_result['errors'])}"
+                message += f"\n\n⚠️ Ошибки: {len(restore_result['errors'])}"
             
             await bot.send_message(
                 chat_id=settings.admin_chat_id,

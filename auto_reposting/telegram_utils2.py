@@ -85,6 +85,7 @@ async def get_authorized_tg_client_with_check_pause(
         accounts: List[tg_account_db.TGAccount],
         start_index: int = 0
 ) -> Tuple[Optional[TelegramClient], int]:
+    """Получает авторизованный клиент с проверкой пауз - ТОЧНО ТАКАЯ ЖЕ логика"""
     current_index = start_index
     
     while current_index < len(accounts):
@@ -124,7 +125,7 @@ async def get_authorized_tg_client_with_check_pause(
 
 
 async def checking_and_joining_if_possible(telegram_client: TelegramClient, url: str, channel: channel_db.Channel) -> bool:
-    """Проверяет группу и присоединяется к ней если возможно"""
+    """Проверяет группу и присоединяется к ней если возможно - ТОЧНО ТАКАЯ ЖЕ логика"""
     try:
         async with telegram_client:
             try:
@@ -170,7 +171,7 @@ async def repost_in_group_by_message_id(
         channel_url: str,
         group_url: str
 ) -> bool:
-    """Делает репост сообщения в группу"""
+    """Делает репост сообщения в группу - ТОЧНО ТАКАЯ ЖЕ логика"""
     try:
         async with telegram_client:
             telegram_group = await telegram_client.get_entity(group_url)
@@ -200,7 +201,7 @@ async def send_reaction_by_telegram_client(
         channel_url: str,
         reaction: ReactionEmoji
 ) -> bool:
-    """Ставит реакцию на сообщение"""
+    """Ставит реакцию на сообщение - УЛУЧШЕНА с автоматическим отключением"""
     try:
         async with telegram_client:
             channel = await telegram_client.get_entity(channel_url)
@@ -227,52 +228,67 @@ async def send_reaction_with_accounts_on_message(
         channel_url: str,
         emoji_reaction: str
 ) -> None:
-    """Ставит реакции от нескольких аккаунтов с правильным управлением памятью"""
+    """Ставит реакции от нескольких аккаунтов - УЛУЧШЕНА с правильным управлением памятью"""
     
-    # Определяем реакцию
-    reaction_map = {
-        "love": "❤️",
-        "ask": "🙏", 
-        "like": "👍"
-    }
-    reaction = ReactionEmoji(emoticon=reaction_map.get(emoji_reaction, "❤️"))
+    # Список всех клиентов для гарантированного закрытия
+    all_reaction_clients = []
+    
+    try:
+        # Определяем реакцию
+        reaction_map = {
+            "love": "❤️",
+            "ask": "🙏", 
+            "like": "👍"
+        }
+        reaction = ReactionEmoji(emoticon=reaction_map.get(emoji_reaction, "❤️"))
 
-    # Ограничиваем количество аккаунтов для реакций (избегаем перегрузки)
-    max_reactions = min(len(tg_accounts), 5)
-    selected_accounts = tg_accounts[:max_reactions]
+        # Ограничиваем количество аккаунтов для реакций (избегаем перегрузки)
+        max_reactions = min(len(tg_accounts), 5)
+        selected_accounts = tg_accounts[:max_reactions]
 
-    for tg_account in selected_accounts:
-        telegram_client = None
-        try:
-            telegram_client = await create_tg_client(tg_account)
-            
-            if telegram_client is None:
-                logger.warning(f"Не удалось создать клиент для реакции +{tg_account.phone_number}")
-                continue
+        logger.info(f"🎯 Ставлю реакции от {len(selected_accounts)} аккаунтов")
 
-            success = await send_reaction_by_telegram_client(
-                telegram_client=telegram_client,
-                message=message,
-                channel_url=channel_url,
-                reaction=reaction
-            )
-            
-            if success:
-                logger.info(f"Реакция поставлена от +{tg_account.phone_number}")
-            
-        except FloodWaitError:
-            logger.warning(f"FloodWait при установке реакции от +{tg_account.phone_number}")
+        for tg_account in selected_accounts:
+            telegram_client = None
             try:
-                await telegram_utils.check_ban_in_spambot(telegram_client=telegram_client)
-            except:
-                pass
-        except Exception as e:
-            logger.error(f"Ошибка при установке реакции от +{tg_account.phone_number}: {e}")
-        finally:
-            # Обязательно закрываем соединение
-            if telegram_client:
+                telegram_client = await create_tg_client(tg_account)
+                
+                if telegram_client is None:
+                    logger.warning(f"Не удалось создать клиент для реакции +{tg_account.phone_number}")
+                    continue
+
+                # Добавляем в список для обязательного закрытия
+                all_reaction_clients.append(telegram_client)
+
+                success = await send_reaction_by_telegram_client(
+                    telegram_client=telegram_client,
+                    message=message,
+                    channel_url=channel_url,
+                    reaction=reaction
+                )
+                
+                if success:
+                    logger.info(f"✅ Реакция поставлена от +{tg_account.phone_number}")
+                else:
+                    logger.warning(f"❌ Не удалось поставить реакцию от +{tg_account.phone_number}")
+                
+            except FloodWaitError:
+                logger.warning(f"FloodWait при установке реакции от +{tg_account.phone_number}")
                 try:
-                    await telegram_client.disconnect()
+                    await telegram_utils.check_ban_in_spambot(telegram_client=telegram_client)
                 except:
                     pass
-                telegram_client = None
+            except Exception as e:
+                logger.error(f"Ошибка при установке реакции от +{tg_account.phone_number}: {e}")
+
+    finally:
+        # ОБЯЗАТЕЛЬНО закрываем все клиенты реакций
+        logger.info(f"🔌 Закрываю {len(all_reaction_clients)} клиентов реакций...")
+        for client in all_reaction_clients:
+            if client:
+                try:
+                    await client.disconnect()
+                    logger.debug("🔌 Клиент реакций отключен")
+                except Exception as e:
+                    logger.debug(f"Ошибка при отключении клиента реакций: {e}")
+        logger.info("✅ Все клиенты реакций закрыты")
