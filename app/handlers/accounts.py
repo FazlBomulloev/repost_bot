@@ -8,7 +8,28 @@ from app.keyboards import accounts as accounts_keyboard, general as general_keyb
 from app.states import Account as AccountStates
 from core.models import tg_account as tg_account_db, channel as channel_db
 
+# Импортируем глобальный процессор каналов
+from auto_reposting.channel_processor import channel_processor
+
 router = Router()
+
+
+async def update_channel_workers_if_needed(channel_guid: str = None):
+    """Обновляет воркеры каналов при изменении аккаунтов"""
+    try:
+        if channel_guid:
+            # Проверяем конкретный канал
+            await channel_processor.ensure_worker_for_channel(channel_guid)
+            await channel_processor.remove_worker_if_no_accounts(channel_guid)
+        else:
+            # Проверяем все каналы (при массовых операциях)
+            channels = await channel_db.get_channels()
+            for channel in channels:
+                guid = str(channel.guid)
+                await channel_processor.ensure_worker_for_channel(guid)
+                await channel_processor.remove_worker_if_no_accounts(guid)
+    except Exception as e:
+        print(f"Ошибка при обновлении воркеров: {e}")
 
 
 @router.callback_query(F.data == "accounts")
@@ -103,8 +124,12 @@ async def confirm_transfer_free_accounts(callback: CallbackQuery, state: FSMCont
         channel_guid=channel.guid,
         count_accounts=state_data["count_accounts"]
     )
+    
+    # 🎉 НОВОЕ: Обновляем воркеры после переноса аккаунтов
+    await update_channel_workers_if_needed(str(channel.guid))
+    
     await callback.message.edit_text(
-        text=f"✅ Успешно перенес аккаунты в канал: {channel.url}",
+        text=f"✅ Успешно перенес аккаунты в канал: {channel.url}\n🔄 Воркер канала обновлен!",
         reply_markup=general_keyboard.back(callback_data="back_to_accounts"),
         disable_web_page_preview=True
     )
@@ -138,8 +163,11 @@ async def add_accounts_state(message: Message, state: FSMContext) -> None:
 async def stop_adding_accounts(message: Message, state: FSMContext) -> None:
     await state.clear()
 
+    # 🎉 НОВОЕ: Обновляем воркеры после добавления аккаунтов
+    await update_channel_workers_if_needed()
+
     await message.answer(
-        text="*️⃣ Успешно закончил прием аккаунтов!",
+        text="*️⃣ Успешно закончил прием аккаунтов!\n🔄 Воркеры каналов обновлены!",
         reply_markup=accounts_keyboard.back_to_accounts()
     )
 
@@ -168,11 +196,25 @@ async def del_accounts(callback: CallbackQuery, state: FSMContext) -> None:
 @router.message(F.text, AccountStates.del_without_channel)
 async def del_accounts_state(message: Message, state: FSMContext) -> None:
     await state.clear()
+    
+    # Собираем каналы, которые могут потерять аккаунты
+    affected_channels = set()
+    
     for i in message.text.split("\n"):
         phone_number = i.split("/")[-1].replace("+", "")
+        
+        # Получаем аккаунт до удаления чтобы знать его канал
+        account = await tg_account_db.get_tg_account_by_phone_number(phone_number=int(phone_number))
+        if account and account.channel_guid:
+            affected_channels.add(str(account.channel_guid))
+        
         await tg_account_db.set_delete_status_tg_account_by_phone_number(phone_number=phone_number)
+    
+    # 🎉 НОВОЕ: Обновляем воркеры для затронутых каналов
+    for channel_guid in affected_channels:
+        await update_channel_workers_if_needed(channel_guid)
 
     await message.answer(
-        text="*️⃣ Успешно удалил аккаунты!",
+        text="*️⃣ Успешно удалил аккаунты!\n🔄 Воркеры затронутых каналов обновлены!",
         reply_markup=accounts_keyboard.back_to_accounts()
     )

@@ -124,9 +124,16 @@ async def get_authorized_tg_client_with_check_pause(
             continue
 
 
-async def send_message(chat_id: int, text: str) -> None:
-    await bot.send_message(chat_id=chat_id, text=text)
-    await bot.session.close()
+async def send_message(chat_id: int, text: str) -> bool:
+    try:
+        await bot.send_message(chat_id=chat_id, text=text)
+        return True
+    except Exception as e:
+        if "blocked by the user" in str(e):
+            logger.warning(f"🚫 Бот заблокирован пользователем {chat_id}")
+        else:
+            logger.error(f"❌ Ошибка отправки: {e}")
+        return False 
 
 
 async def checking_and_joining_if_possible(tg_client: TelegramClient, url: str, channel: channel_db.Channel) -> bool:

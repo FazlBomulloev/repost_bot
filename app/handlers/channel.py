@@ -15,7 +15,28 @@ from core.models import channel as channel_db, group as group_db, tg_account as 
 from core.schemas import group as group_schemas
 from core.schemas import channel as channel_schemas
 
+# Импортируем глобальный процессор каналов
+from auto_reposting.channel_processor import channel_processor
+
 router = Router()
+
+
+async def update_channel_workers_if_needed(channel_guid: str = None):
+    """Обновляет воркеры каналов при изменении аккаунтов"""
+    try:
+        if channel_guid:
+            # Проверяем конкретный канал
+            await channel_processor.ensure_worker_for_channel(channel_guid)
+            await channel_processor.remove_worker_if_no_accounts(channel_guid)
+        else:
+            # Проверяем все каналы (при массовых операциях)
+            channels = await channel_db.get_channels()
+            for channel in channels:
+                guid = str(channel.guid)
+                await channel_processor.ensure_worker_for_channel(guid)
+                await channel_processor.remove_worker_if_no_accounts(guid)
+    except Exception as e:
+        print(f"Ошибка при обновлении воркеров: {e}")
 
 
 @router.callback_query(F.data == "channels")
@@ -62,7 +83,6 @@ async def add_channel_state(message: Message, state: FSMContext) -> None:
         if random_telegram_client is not None:
             stop_iter = True
 
-
     url = message.text
     async with random_telegram_client:
         try:
@@ -74,7 +94,7 @@ async def add_channel_state(message: Message, state: FSMContext) -> None:
             )
             return
 
-    await channel_db.create_channel(channel_in=channel_schemas.ChannelCreate(url=url, telegram_channel_id=channel.id))
+    new_channel = await channel_db.create_channel(channel_in=channel_schemas.ChannelCreate(url=url, telegram_channel_id=channel.id))
 
     await message.answer(
         text=f"*️⃣ Успешно добавил ссылку: {url}",
@@ -151,28 +171,6 @@ async def add_groups_state(message: Message, state: FSMContext) -> None:
             await group_db.create_group(
                 group_in=group_schemas.GroupCreate(channel_guid=channel_guid, url=link)
             )
-
-
-        # links = i.split(" ")
-        # if links:
-        #     for j in links:
-        #         group_link = j
-        #         if i.startswith("@"):
-        #             group_link = f"https://t.me/{i.replace("@", "")}"
-        #
-        #         await group_db.create_group(
-        #             group_in=group_schemas.GroupCreate(channel_guid=channel_guid, url=group_link)
-        #         )
-        #
-        #     continue
-        #
-        # group_link = i
-        # if i.startswith("@"):
-        #     group_link = f"https://t.me/{i.replace("@", "")}"
-        #
-        # await group_db.create_group(
-        #     group_in=group_schemas.GroupCreate(channel_guid=channel_guid, url=group_link)
-        # )
 
     await message.answer(
         text=f"*️⃣ Успешно добавил группы!",
@@ -262,13 +260,14 @@ async def add_accounts_with_channel_state(message: Message, state: FSMContext) -
             await message.answer(text)
 
 
-
 @router.message(Command("stop"), AccountStates.add_with_channel)
 async def stop_adding_accounts(message: Message, state: FSMContext) -> None:
     state_data = await state.get_data()
     channel_guid = state_data["channel_guid"]
-
     await state.clear()
+    
+    await update_channel_workers_if_needed(channel_guid)
+
     await message.answer(
         text="*️⃣ Успешно закончил прием аккаунтов!",
         reply_markup=general_keyboard.back(callback_data=f"channel_guid_{channel_guid}")
@@ -296,6 +295,8 @@ async def del_accounts_state(message: Message, state: FSMContext) -> None:
     for i in message.text.split("\n"):
         phone_number = i.split("/")[-1].replace("+", "")
         await tg_account_db.set_delete_status_tg_account_by_phone_number(phone_number=phone_number)
+
+    await update_channel_workers_if_needed(channel_guid)
 
     await message.answer(
         text="*️⃣ Успешно удалил аккаунты!",
@@ -366,16 +367,23 @@ async def set_count_transfer_accounts(message: Message, state: FSMContext) -> No
 @router.callback_query(AccountStates.transfer_accounts, F.data == "confirm_transfer_accounts")
 async def confirm_transfer_accounts(callback: CallbackQuery, state: FSMContext) -> None:
     state_data = await state.get_data()
+    from_channel_guid = str(state_data["channel"].guid)
+    to_channel_guid = str(state_data["to_channel"].guid)
 
     await tg_account_db.set_new_channel_guid_where_channel_guid(
-        channel_guid=state_data["channel"].guid,
+        channel_guid=from_channel_guid,
         new_channel_guid=state_data["to_channel"].guid,
         count_accounts=state_data["count_accounts"]
     )
+    
+    await state.clear()
+
+    await update_channel_workers_if_needed(from_channel_guid)
+    await update_channel_workers_if_needed(to_channel_guid)
 
     await callback.message.edit_text(
         text=f"*️⃣ Успешно перенес аккаунты из канала: {state_data['channel'].url} в канал: {state_data['to_channel'].url}",
-        reply_markup=general_keyboard.back(callback_data=f"channel_guid_{state_data['channel'].guid}"),
+        reply_markup=general_keyboard.back(callback_data=f"channel_guid_{from_channel_guid}"),
         disable_web_page_preview=True
     )
 
@@ -393,7 +401,6 @@ async def delete_channel(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
 
-
 @router.callback_query(F.data == "confirm_delete_channel", AccountStates.delete_channel)
 async def confirm_delete_channel(callback: CallbackQuery, state: FSMContext) -> None:
     state_data = await state.get_data()
@@ -405,7 +412,11 @@ async def confirm_delete_channel(callback: CallbackQuery, state: FSMContext) -> 
         count_accounts=count_accounts
     )
     await channel_db.delete_channel_by_guid(guid=channel_guid)
+    await state.clear()
+    
+    await update_channel_workers_if_needed(channel_guid)
+    
     await callback.message.edit_text(
-        text="*️⃣ Успешно удалил аккаунт!",
+        text="*️⃣ Успешно удалил канал!",
         reply_markup=general_keyboard.back(callback_data="channels")
     )

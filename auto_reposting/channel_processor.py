@@ -4,7 +4,7 @@ from typing import Dict, Set, Optional
 from dataclasses import dataclass
 from loguru import logger
 
-from core.models import channel as channel_db
+from core.models import channel as channel_db, tg_account as tg_account_db
 
 
 @dataclass
@@ -21,7 +21,7 @@ class ChannelWorker:
         self.channel_guid = channel_guid
         self.channel_url = channel_url
         self.worker_id = worker_id
-        self.task_queue = asyncio.Queue(maxsize=50)  # Небольшая очередь на канал
+        self.task_queue = asyncio.Queue(maxsize=100)  # Увеличенная очередь
         self.running = False
         self.processed_count = 0
         self.error_count = 0
@@ -33,33 +33,56 @@ class ChannelWorker:
         self.running = True
         self.logger.info(f"🚀 Воркер {self.worker_id} запущен для канала {self.channel_url}")
         
+        # Создаем несколько параллельных обработчиков для ускорения
+        workers = []
+        num_parallel_workers = 3  # Количество параллельных обработчиков
+        
+        for i in range(num_parallel_workers):
+            worker_task = asyncio.create_task(self._worker_loop(i + 1))
+            workers.append(worker_task)
+        
+        # Ждем завершения всех воркеров
+        try:
+            await asyncio.gather(*workers)
+        except Exception as e:
+            self.logger.error(f"Ошибка в воркерах канала: {e}")
+        finally:
+            # Отменяем все незавершенные задачи
+            for task in workers:
+                if not task.done():
+                    task.cancel()
+    
+    async def _worker_loop(self, sub_worker_id: int):
+        """Цикл обработки для под-воркера"""
+        sub_logger = self.logger.bind(sub_worker=sub_worker_id)
+        sub_logger.info(f"🔥 Под-воркер {sub_worker_id} запущен")
+        
         while self.running:
             try:
                 # Получаем задачу с таймаутом
                 task = await asyncio.wait_for(
                     self.task_queue.get(), 
-                    timeout=10.0  # Больший таймаут для каналов
+                    timeout=10.0
                 )
                 
                 self.current_task = task
-                await self._process_channel_task(task)
+                await self._process_channel_task(task, sub_logger)
                 self.task_queue.task_done()
                 self.processed_count += 1
                 self.current_task = None
                 
             except asyncio.TimeoutError:
-                # Нормально, просто ждем новые задачи для этого канала
                 continue
             except Exception as e:
-                self.logger.error(f"Критическая ошибка в воркере канала: {e}")
+                sub_logger.error(f"Критическая ошибка в под-воркере: {e}")
                 self.error_count += 1
                 self.current_task = None
                 await asyncio.sleep(1)
     
-    async def _process_channel_task(self, task: ChannelTask):
+    async def _process_channel_task(self, task: ChannelTask, sub_logger):
         """Обработка задачи конкретного канала"""
         start_time = datetime.now()
-        self.logger.info(f"📨 Начинаю обработку сообщения {task.message_id} канала {self.channel_url}")
+        sub_logger.info(f"📨 Начинаю обработку сообщения {task.message_id}")
         
         try:
             # Импортируем функцию из process_post3.py
@@ -72,11 +95,11 @@ class ChannelWorker:
             )
             
             processing_time = (datetime.now() - start_time).total_seconds()
-            self.logger.success(f"✅ Сообщение {task.message_id} канала {self.channel_url} обработано за {processing_time:.1f} сек")
+            sub_logger.success(f"✅ Сообщение {task.message_id} обработано за {processing_time:.1f} сек")
             
         except Exception as e:
             processing_time = (datetime.now() - start_time).total_seconds()
-            self.logger.error(f"❌ Ошибка при обработке {task.message_id} канала {self.channel_url} за {processing_time:.1f} сек: {e}")
+            sub_logger.error(f"❌ Ошибка при обработке {task.message_id} за {processing_time:.1f} сек: {e}")
             self.error_count += 1
             raise
     
@@ -123,7 +146,7 @@ class ChannelWorker:
         }
 
 
-class ChannelDedicatedProcessor:
+class ChannelProcessor:
     """Менеджер воркеров с выделенными воркерами для каждого канала"""
     
     def __init__(self):
@@ -137,8 +160,17 @@ class ChannelDedicatedProcessor:
         
         logger.info("🏗️ Инициализирован процессор с выделенными воркерами для каналов")
     
+    async def _channel_has_accounts(self, channel_guid: str) -> bool:
+        """Проверяет, есть ли у канала аккаунты"""
+        try:
+            accounts = await tg_account_db.get_working_accounts_by_channel(channel_guid)
+            return len(accounts) > 0
+        except Exception as e:
+            logger.error(f"Ошибка при проверке аккаунтов для канала {channel_guid}: {e}")
+            return False
+    
     async def start(self):
-        """Запуск всех воркеров для каждого канала"""
+        """Запуск воркеров только для каналов с аккаунтами"""
         self.running = True
         
         # Получаем все каналы из базы
@@ -148,24 +180,106 @@ class ChannelDedicatedProcessor:
             logger.warning("⚠️ Нет каналов в базе данных!")
             return
         
-        logger.info(f"🔄 Создание воркеров для {len(channels)} каналов...")
+        logger.info(f"🔄 Проверяю {len(channels)} каналов на наличие аккаунтов...")
         
-        # Создаем воркер для каждого канала
+        # Создаем воркеры только для каналов с аккаунтами
+        active_channels = 0
         for i, channel in enumerate(channels):
+            channel_guid = str(channel.guid)
+            
+            # Проверяем, есть ли аккаунты у канала
+            if await self._channel_has_accounts(channel_guid):
+                worker = ChannelWorker(
+                    channel_guid=channel_guid,
+                    channel_url=channel.url,
+                    worker_id=i + 1
+                )
+                
+                self.channel_workers[channel_guid] = worker
+                self.processing_messages[channel_guid] = set()
+                
+                # Запускаем воркер в отдельной задаче
+                task = asyncio.create_task(worker.start())
+                self.worker_tasks[channel_guid] = task
+                
+                active_channels += 1
+                logger.info(f"✅ Воркер создан для канала {channel.url}")
+            else:
+                logger.info(f"⏭️ Канал {channel.url} пропущен - нет аккаунтов")
+        
+        logger.success(f"✅ Запущено {active_channels} воркеров для каналов с аккаунтами")
+    
+    async def ensure_worker_for_channel(self, channel_guid: str) -> bool:
+        """Создает воркер для канала если его нет и есть аккаунты"""
+        if channel_guid in self.channel_workers:
+            return True  # Воркер уже существует
+            
+        # Проверяем, есть ли аккаунты
+        if not await self._channel_has_accounts(channel_guid):
+            logger.info(f"Не создаю воркер для канала {channel_guid} - нет аккаунтов")
+            return False
+        
+        try:
+            # Получаем информацию о канале
+            channel = await channel_db.get_channel_by_guid(channel_guid)
+            if not channel:
+                logger.error(f"Канал {channel_guid} не найден в БД")
+                return False
+            
+            # Создаем воркер
+            worker_id = len(self.channel_workers) + 1
             worker = ChannelWorker(
-                channel_guid=str(channel.guid),
+                channel_guid=channel_guid,
                 channel_url=channel.url,
-                worker_id=i + 1
+                worker_id=worker_id
             )
             
-            self.channel_workers[str(channel.guid)] = worker
-            self.processing_messages[str(channel.guid)] = set()
+            self.channel_workers[channel_guid] = worker
+            self.processing_messages[channel_guid] = set()
             
-            # Запускаем воркер в отдельной задаче
+            # Запускаем воркер
             task = asyncio.create_task(worker.start())
-            self.worker_tasks[str(channel.guid)] = task
+            self.worker_tasks[channel_guid] = task
+            
+            logger.success(f"🎉 Создан новый воркер для канала {channel.url}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка при создании воркера для канала {channel_guid}: {e}")
+            return False
+    
+    async def remove_worker_if_no_accounts(self, channel_guid: str) -> bool:
+        """Удаляет воркер канала если у него нет аккаунтов"""
+        if channel_guid not in self.channel_workers:
+            return True  # Воркера и так нет
+            
+        # Проверяем, есть ли аккаунты
+        if await self._channel_has_accounts(channel_guid):
+            return False  # Есть аккаунты, воркер нужен
         
-        logger.success(f"✅ Все {len(channels)} воркеров каналов запущены")
+        try:
+            # Останавливаем воркер
+            worker = self.channel_workers[channel_guid]
+            worker.stop()
+            
+            # Отменяем задачу
+            if channel_guid in self.worker_tasks:
+                task = self.worker_tasks[channel_guid]
+                if not task.done():
+                    task.cancel()
+                del self.worker_tasks[channel_guid]
+            
+            # Удаляем из словарей
+            del self.channel_workers[channel_guid]
+            if channel_guid in self.processing_messages:
+                del self.processing_messages[channel_guid]
+            
+            logger.info(f"🗑️ Воркер канала {worker.channel_url} удален - нет аккаунтов")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка при удалении воркера канала {channel_guid}: {e}")
+            return False
     
     async def add_message(self, channel_id: int, message_id: int) -> bool:
         """
@@ -183,6 +297,11 @@ class ChannelDedicatedProcessor:
                 return False
             
             channel_guid = str(channel.guid)
+            
+            # Убеждаемся что воркер существует
+            if not await self.ensure_worker_for_channel(channel_guid):
+                logger.warning(f"❌ Не удалось создать воркер для канала {channel.url}")
+                return False
             
             # Найти соответствующий воркер
             if channel_guid not in self.channel_workers:
@@ -309,4 +428,4 @@ class ChannelDedicatedProcessor:
 
 
 # Глобальный экземпляр процессора
-channel_processor = ChannelDedicatedProcessor()
+channel_processor = ChannelProcessor()

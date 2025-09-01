@@ -47,25 +47,25 @@ async def check_subscribe_in_channels(client: TelegramClient) -> None:
 async def get_working_client() -> tuple[TelegramClient, tg_account_db.TGAccount]:
     """Получает рабочий клиент с правильной обработкой ошибок"""
     tg_accounts = await tg_account_db.get_tg_accounts_by_status("WORKING")
-    
+
     if not tg_accounts:
         logger.error("Нет рабочих аккаунтов в базе")
         return None, None
-    
+
     # Перемешиваем аккаунты для равномерного распределения нагрузки
     random.shuffle(tg_accounts)
-    
+
     max_attempts = min(len(tg_accounts), 10)  # Ограничиваем количество попыток
-    
+
     for attempt in range(max_attempts):
         account = tg_accounts[attempt]
-        
+
         # Проверяем паузу аккаунта
         if account.last_datetime_pause and account.pause_in_seconds:
             if not await tg_account_db.has_pause_paused(account):
                 logger.info(f"Аккаунт +{account.phone_number} на паузе, пропускаем")
                 continue
-        
+
         try:
             client = await telegram_utils2.create_tg_client(account)
             if client is not None:
@@ -73,35 +73,35 @@ async def get_working_client() -> tuple[TelegramClient, tg_account_db.TGAccount]
                 return client, account
             else:
                 logger.warning(f"Не удалось авторизовать аккаунт +{account.phone_number}")
-                
+
         except Exception as e:
             logger.error(f"Ошибка при создании клиента для +{account.phone_number}: {e}")
             continue
-    
+
     logger.error("Не удалось найти рабочий аккаунт после всех попыток")
     return None, None
 
 
 async def main() -> None:
     logger.info("Запущен объединенный бот (управление + репостинг)...")
-    
+
     # Запускаем Telegram бота для управления
     from aiogram import Dispatcher
     from app.handlers import setup_routes
     from core.settings import bot
-    
+
     dp = Dispatcher()
     setup_routes(dp=dp)
-    
+
     logger.info("🤖 Запуск Telegram бота для управления...")
     bot_task = asyncio.create_task(dp.start_polling(bot))
     logger.success("✅ Telegram бот запущен")
-    
+
     # Запускаем процессор каналов (выделенный воркер на канал)
     logger.info("🚀 Запуск процессора каналов...")
     await channel_processor.start()
     logger.success("✅ Процессор каналов запущен")
-    
+
     # Запускаем автовосстановление пауз как фоновую задачу
     pause_restorer_task = None
     try:
@@ -110,36 +110,36 @@ async def main() -> None:
         logger.success("✅ Автовосстановление пауз запущено")
     except Exception as e:
         logger.error(f"Ошибка при запуске автовосстановления: {e}")
-    
+
     # Получаем рабочий клиент
     random_telegram_client, random_tg_account = await get_working_client()
-    
+
     if random_telegram_client is None:
         logger.error("Нет доступных аккаунтов для работы. Ожидание 5 минут...")
         if pause_restorer_task:
             pause_restorer_task.cancel()
-        await message_processor.stop()
+        await channel_processor.stop()
         await asyncio.sleep(300)
         return
-    
+
     try:
         await random_telegram_client.connect()
-        
+
         @random_telegram_client.on(NewMessage)
         async def new_message(event: NewMessage.Event) -> None:
             try:
                 message_id = event.original_update.message.id
                 channel_id = event.original_update.message.peer_id.channel_id
-                
+
                 # Проверяем, что канал в нашем списке
                 channels = await channel_db.get_channels()
                 if channel_id not in [channel.telegram_channel_id for channel in channels]:
                     return
-                    
+
             except Exception as e:
                 logger.error(f"Ошибка при обработке события: {e}")
                 return
-            
+
             # Проверяем рабочее время
             try:
                 current_time = datetime.now().time()
@@ -157,26 +157,26 @@ async def main() -> None:
 
             # Добавляем в очередь вместо запуска subprocess
             try:
-                success = await message_processor.add_message(channel_id, message_id)
-                
+                success = await channel_processor.add_message(channel_id, message_id)
+
                 if success:
                     logger.info(f"✅ Сообщение {message_id} добавлено в очередь")
-                    
+
                     # Логируем статистику
-                    stats = message_processor.get_stats()
+                    stats = channel_processor.get_stats()
                     logger.info(f"📊 Очередь: {stats['queue_size']}, Обработано всего: {stats['total_processed']}")
                 else:
                     logger.warning(f"⚠️ Сообщение {message_id} не добавлено (дубль или переполнение)")
-                    
+
             except Exception as e:
                 logger.error(f"Ошибка при добавлении сообщения в очередь: {e}")
 
         # Подписываемся на каналы
         await check_subscribe_in_channels(client=random_telegram_client)
-        
+
         # Основной цикл работы
         await random_telegram_client.run_until_disconnected()
-        
+
     except Exception as e:
         logger.error(f"Ошибка в основном цикле: {e}")
     finally:
@@ -188,11 +188,11 @@ async def main() -> None:
                 await bot_task
             except asyncio.CancelledError:
                 pass
-        
+
         # Останавливаем процессор сообщений
         logger.info("🛑 Остановка процессора сообщений...")
-        await message_processor.stop()
-        
+        await channel_processor.stop()
+
         # Останавливаем автовосстановление
         if pause_restorer_task:
             logger.info("🛑 Остановка автовосстановления пауз...")
@@ -202,7 +202,7 @@ async def main() -> None:
             except asyncio.TimeoutError:
                 logger.warning("Таймаут при остановке автовосстановления")
                 pause_restorer_task.cancel()
-        
+
         # Обязательно закрываем соединение
         if random_telegram_client and random_telegram_client.is_connected():
             try:
@@ -214,7 +214,7 @@ async def main() -> None:
 
 if __name__ == "__main__":
     logger.add(f"logs/{log_file_name}", rotation="1 day", retention="10 days", compression="zip")
-    
+
     while True:
         try:
             asyncio.run(main())
@@ -223,7 +223,7 @@ if __name__ == "__main__":
             break
         except Exception as e:
             logger.exception(f"ЗАВЕРШИЛСЯ С ОШИБКОЙ: {e.__class__.__name__}: {e}")
-        
+
         # Ждем перед перезапуском
         logger.info("Перезапуск через 30 секунд...")
         asyncio.run(asyncio.sleep(30))
