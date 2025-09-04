@@ -19,10 +19,11 @@ class Repost(Base):
 
 async def create_repost(repost_in: repost_schemas.RepostCreate) -> Repost:
     async with async_session_maker() as session:
-        group = Repost(repost_in.model_dump())
-        session.add(group)
+        repost = Repost(**repost_in.model_dump())
+        
+        session.add(repost)
         await session.commit()
-        return group
+        return repost
 
 
 async def get_repost_for_day(channel_guid: str) -> List[Repost]:
