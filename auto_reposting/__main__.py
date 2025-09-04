@@ -1,6 +1,9 @@
 import asyncio
 import random
 from datetime import datetime
+
+from aiogram import Dispatcher
+from app.handlers import setup_routes
 from loguru import logger
 from telethon import TelegramClient, errors
 from telethon.errors import UserAlreadyParticipantError, FloodWaitError
@@ -11,7 +14,7 @@ from telethon.tl.functions.channels import JoinChannelRequest
 from core.models import tg_account as tg_account_db, channel as channel_db
 from auto_reposting import telegram_utils, telegram_utils2
 from auto_pause_restorer import start_pause_restorer, stop_pause_restorer, pause_restorer
-from core.settings import json_settings
+from core.settings import json_settings, bot  # ✅ ДОБАВИЛИ ИМПОРТ БОТА
 from auto_reposting.channel_processor import channel_processor
 
 log_file_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".log"
@@ -85,15 +88,18 @@ async def get_working_client() -> tuple[TelegramClient, tg_account_db.TGAccount]
 async def main() -> None:
     logger.info("Запущен объединенный бот (управление + репостинг)...")
 
-    # Запускаем Telegram бота для управления
-    from aiogram import Dispatcher
-    from app.handlers import setup_routes
-    from core.settings import bot
-
     dp = Dispatcher()
-    setup_routes(dp=dp)
+    
+    # Настраиваем роутеры
+    try:
+        setup_routes(dp=dp)
+        logger.info("✅ Роутеры успешно настроены")
+    except Exception as e:
+        logger.error(f"❌ Ошибка настройки роутеров: {e}")
+        return
 
     logger.info("🤖 Запуск Telegram бота для управления...")
+    # ✅ ИСПРАВЛЕНО: Передаем экземпляр бота в start_polling
     bot_task = asyncio.create_task(dp.start_polling(bot))
     logger.success("✅ Telegram бот запущен")
 
@@ -164,7 +170,7 @@ async def main() -> None:
 
                     # Логируем статистику
                     stats = channel_processor.get_stats()
-                    logger.info(f"📊 Очередь: {stats['queue_size']}, Обработано всего: {stats['total_processed']}")
+                    logger.info(f"📊 Очередь: {stats['total_queue_size']}, Обработано всего: {stats['total_processed']}")
                 else:
                     logger.warning(f"⚠️ Сообщение {message_id} не добавлено (дубль или переполнение)")
 
@@ -211,12 +217,23 @@ async def main() -> None:
             except Exception as e:
                 logger.error(f"Ошибка при отключении клиента: {e}")
 
+        # ✅ ИСПРАВЛЕНО: Правильная остановка диспетчера
+        try:
+            await dp.stop_polling()
+            logger.info("✅ Диспетчер остановлен")
+        except Exception as e:
+            logger.debug(f"Ошибка при остановке диспетчера: {e}")
+
 
 if __name__ == "__main__":
     logger.add(f"logs/{log_file_name}", rotation="1 day", retention="10 days", compression="zip")
 
     while True:
         try:
+            # Очищаем глобальные ресурсы перед каждым запуском
+            import gc
+            gc.collect()
+            
             asyncio.run(main())
         except KeyboardInterrupt:
             logger.info("Получен сигнал остановки")

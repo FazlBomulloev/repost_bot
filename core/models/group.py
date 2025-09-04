@@ -18,7 +18,7 @@ class Group(Base):
 
 async def create_group(group_in: group_schemas.GroupCreate) -> Group:
     async with async_session_maker() as session:
-        group = Group(group_in.model_dump())
+        group = Group(**group_in.model_dump())
         session.add(group)
         await session.commit()
         return group

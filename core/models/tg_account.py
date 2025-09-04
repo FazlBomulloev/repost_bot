@@ -25,7 +25,7 @@ class TGAccount(Base):
 
 async def create_tg_account(tg_account_in: tg_account_schemas.TGAccountCreate) -> TGAccount:
     async with async_session_maker() as session:
-        tg_account = TGAccount(tg_account_in.model_dump())
+        tg_account = TGAccount(**tg_account_in.model_dump())
         session.add(tg_account)
         await session.commit()
         return tg_account

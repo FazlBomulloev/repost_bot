@@ -18,7 +18,7 @@ class Channel(Base):
 
 async def create_channel(channel_in: channel_schemas.ChannelCreate) -> Channel:
     async with async_session_maker() as session:
-        channel = Channel(channel_in.model_dump())
+        channel = Channel(**channel_in.model_dump())
         session.add(channel)
         await session.commit()
         return channel
