@@ -74,6 +74,202 @@ async def settings_pauses(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
 
+# 🎯 НОВЫЕ НАСТРОЙКИ ДЛЯ ПОСЛЕДОВАТЕЛЬНОГО РЕЖИМА
+@router.callback_query(F.data == "settings_sequential")
+async def settings_sequential(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    
+    try:
+        delay_between_reposts = await json_settings.async_get_attribute("delay_between_reposts")
+        delay_between_groups = await json_settings.async_get_attribute("delay_between_groups")
+        max_groups_per_post = await json_settings.async_get_attribute("max_groups_per_post")
+        check_stop_links = await json_settings.async_get_attribute("check_stop_links")
+        
+        settings_text = f"""*️⃣ Настройки последовательного репостинга:
+
+⏱️ Задержка между репостами: {format_time_unit(delay_between_reposts)}
+🔄 Задержка между группами: {format_time_unit(delay_between_groups)}
+📊 Максимум групп на пост: {max_groups_per_post} шт
+🚫 Проверка стоп-ссылок: {'✅ Включена' if check_stop_links else '❌ Отключена'}
+
+Выберите настройку для изменения:"""
+        
+    except Exception as e:
+        settings_text = "*️⃣ Настройки последовательного репостинга:"
+
+    await callback.message.edit_text(
+        text=settings_text,
+        reply_markup=settings_keyboard.sequential_menu()
+    )
+
+
+@router.callback_query(F.data == "set_delay_between_reposts")
+async def set_delay_between_reposts(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(SettingsStates.set_sequential_setting)
+    await state.update_data(setting_key="delay_between_reposts", input_unit="seconds")
+
+    try:
+        current_value = await json_settings.async_get_attribute("delay_between_reposts")
+        
+        hint_text = f"""*️⃣ Задержка между репостами разных сообщений
+
+Текущее значение: {format_time_unit(current_value)}
+
+⏰ Введите новое значение в секундах:
+💡 Рекомендуется: 20-60 секунд для безопасности
+"""
+            
+    except Exception:
+        hint_text = "*️⃣ Введите задержку между репостами в секундах:"
+
+    await callback.message.edit_text(
+        text=hint_text,
+        reply_markup=general_keyboard.back(callback_data="settings_sequential")
+    )
+
+
+@router.callback_query(F.data == "set_delay_between_groups")
+async def set_delay_between_groups(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(SettingsStates.set_sequential_setting)
+    await state.update_data(setting_key="delay_between_groups", input_unit="seconds")
+
+    try:
+        current_value = await json_settings.async_get_attribute("delay_between_groups")
+        
+        hint_text = f"""*️⃣ Задержка между группами в одном репосте
+
+Текущее значение: {format_time_unit(current_value)}
+
+⏰ Введите новое значение в секундах:
+💡 Рекомендуется: 3-10 секунд между группами
+"""
+            
+    except Exception:
+        hint_text = "*️⃣ Введите задержку между группами в секундах:"
+
+    await callback.message.edit_text(
+        text=hint_text,
+        reply_markup=general_keyboard.back(callback_data="settings_sequential")
+    )
+
+
+@router.callback_query(F.data == "set_max_groups_per_post")
+async def set_max_groups_per_post(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(SettingsStates.set_sequential_setting)
+    await state.update_data(setting_key="max_groups_per_post", input_unit="count")
+
+    try:
+        current_value = await json_settings.async_get_attribute("max_groups_per_post")
+        
+        hint_text = f"""*️⃣ Максимальное количество групп для репоста
+
+Текущее значение: {current_value} групп
+
+📊 Введите новое количество:
+💡 Рекомендуется: 20-30 групп для оптимальной скорости
+"""
+            
+    except Exception:
+        hint_text = "*️⃣ Введите максимальное количество групп:"
+
+    await callback.message.edit_text(
+        text=hint_text,
+        reply_markup=general_keyboard.back(callback_data="settings_sequential")
+    )
+
+
+@router.callback_query(F.data == "toggle_check_stop_links")
+async def toggle_check_stop_links(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    
+    try:
+        current_value = await json_settings.async_get_attribute("check_stop_links")
+        new_value = not current_value
+        await json_settings.async_set_attribute("check_stop_links", new_value)
+        
+        status_text = "✅ Включена" if new_value else "❌ Отключена"
+        await callback.message.edit_text(
+            text=f"🚫 Проверка стоп-ссылок: {status_text}",
+            reply_markup=general_keyboard.back(callback_data="settings_sequential")
+        )
+        
+    except Exception as e:
+        await callback.message.edit_text(
+            text=f"❌ Ошибка изменения настройки: {e}",
+            reply_markup=general_keyboard.back(callback_data="settings_sequential")
+        )
+
+
+@router.message(SettingsStates.set_sequential_setting)
+async def set_sequential_setting(message: Message, state: FSMContext) -> None:
+    state_data = await state.get_data()
+    setting_key = state_data["setting_key"]
+    input_unit = state_data.get("input_unit", "seconds")
+    await state.clear()
+    
+    try:
+        user_input = int(message.text)
+        if user_input <= 0:
+            raise ValueError("Значение должно быть больше 0")
+    except ValueError:
+        error_text = "*️⃣ Ошибка!\n\n"
+        if input_unit == "seconds":
+            error_text += "Введите положительное число секунд"
+        elif input_unit == "count":
+            error_text += "Введите положительное число"
+        else:
+            error_text += "Введите положительное число"
+            
+        await message.answer(
+            text=error_text,
+            reply_markup=general_keyboard.back(callback_data="settings_sequential")
+        )
+        return
+
+    # Валидация значений
+    if setting_key == "delay_between_reposts" and user_input > 300:
+        await message.answer(
+            text="⚠️ Слишком большая задержка между репостами (максимум 300 секунд)",
+            reply_markup=general_keyboard.back(callback_data="settings_sequential")
+        )
+        return
+    
+    if setting_key == "delay_between_groups" and user_input > 60:
+        await message.answer(
+            text="⚠️ Слишком большая задержка между группами (максимум 60 секунд)",
+            reply_markup=general_keyboard.back(callback_data="settings_sequential")
+        )
+        return
+    
+    if setting_key == "max_groups_per_post" and (user_input < 5 or user_input > 100):
+        await message.answer(
+            text="⚠️ Количество групп должно быть от 5 до 100",
+            reply_markup=general_keyboard.back(callback_data="settings_sequential")
+        )
+        return
+
+    await json_settings.async_set_attribute(setting_key, user_input)
+    
+    # Форматируем сообщение об успехе
+    if setting_key == "delay_between_reposts":
+        success_text = f"✅ Задержка между репостами: {format_time_unit(user_input)}"
+    elif setting_key == "delay_between_groups":
+        success_text = f"✅ Задержка между группами: {format_time_unit(user_input)}"
+    elif setting_key == "max_groups_per_post":
+        success_text = f"✅ Максимум групп на пост: {user_input} шт"
+    else:
+        success_text = "✅ Значение обновлено!"
+    
+    await message.answer(
+        text=success_text,
+        reply_markup=general_keyboard.back(callback_data="settings_sequential")
+    )
+
+
+# ОСТАЛЬНЫЕ СУЩЕСТВУЮЩИЕ НАСТРОЙКИ (без изменений)
 @router.callback_query(F.data == "pause_after_rate_reposts")
 async def set_pause_after_rate_reposts(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()

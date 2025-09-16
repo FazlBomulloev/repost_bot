@@ -1,7 +1,6 @@
 from aiogram.fsm.state import State, StatesGroup
 
 
-
 class Account(StatesGroup):
     add_with_channel = State()
     del_with_channel = State()
@@ -26,5 +25,6 @@ class Group(StatesGroup):
 
 class Settings(StatesGroup):
     set_settings_pause = State()
+    set_sequential_setting = State()  # 🎯 НОВОЕ СОСТОЯНИЕ для последовательных настроек
     add_stop_link = State()
     set_time = State()
