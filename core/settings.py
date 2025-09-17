@@ -1,5 +1,6 @@
 import json
 import aiofiles
+from typing import List
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
@@ -12,10 +13,31 @@ class Settings(BaseSettings):
     bot_token: SecretStr
     database_url: SecretStr
     json_settings_file: str = "json_settings.json"
+    admin_ids: str = ""  # Новое поле для списка админов через запятую
 
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+
+    def get_admin_list(self) -> List[int]:
+        """Возвращает список ID админов"""
+        if not self.admin_ids:
+            return []
+        
+        try:
+            # Парсим строку с ID через запятую
+            admin_list = []
+            for admin_id in self.admin_ids.split(","):
+                admin_id = admin_id.strip()
+                if admin_id:
+                    admin_list.append(int(admin_id))
+            return admin_list
+        except ValueError:
+            return []
+
+    def is_admin(self, user_id: int) -> bool:
+        """Проверяет, является ли пользователь админом"""
+        return user_id in self.get_admin_list()
 
 
 class JSONSettings:

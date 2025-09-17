@@ -188,9 +188,7 @@ async def get_tg_account_by_phone_number(phone_number: int) -> TGAccount:
         result = await session.execute(query)
         return result.scalars().first()
 
-
 async def get_working_accounts_by_channel(channel_guid: str = None) -> List[TGAccount]:
-    """Получает только рабочие аккаунты (без пауз и блокировок) для конкретного канала или без канала"""
     async with async_session_maker() as session:
         base_query = select(TGAccount).where(TGAccount.status == "WORKING")
         
@@ -202,14 +200,22 @@ async def get_working_accounts_by_channel(channel_guid: str = None) -> List[TGAc
         result = await session.execute(query)
         accounts = list(result.scalars().all())
         
-        # Дополнительно фильтруем аккаунты на паузе
         working_accounts = []
+        current_time = datetime.now()
+        
         for account in accounts:
-            if await has_pause_paused(account):
-                working_accounts.append(account)
+            # Проверяем есть ли пауза
+            if account.last_datetime_pause and account.pause_in_seconds:
+                # Вычисляем время окончания паузы
+                elapsed_time = current_time - account.last_datetime_pause
+                
+                # Если пауза еще не истекла - пропускаем аккаунт
+                if elapsed_time.total_seconds() < account.pause_in_seconds:
+                    continue
+
+            working_accounts.append(account)
                 
         return working_accounts
-
 
 async def cleanup_deleted_accounts() -> int:
     """Удаляет помеченные как DELETED аккаунты из базы данных. Возвращает количество удаленных."""

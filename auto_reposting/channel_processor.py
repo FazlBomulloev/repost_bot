@@ -18,8 +18,6 @@ class ChannelTask:
 
 
 class ChannelWorker:
-    """Воркер для последовательной обработки с проверкой норм и кэшированием групп"""
-    
     def __init__(self, channel_guid: str, channel_url: str, worker_id: int):
         self.channel_guid = channel_guid
         self.channel_url = channel_url
@@ -30,19 +28,15 @@ class ChannelWorker:
         self.error_count = 0
         self.current_task = None
         
+        # Кэш групп для каждого аккаунта
         self.account_groups_cache: Dict[int, Set[str]] = {}  
-        
-        # Под-воркеры для параллельной обработки
-        self.sub_workers = {}
-        self.active_sub_workers = 0
-        self.max_sub_workers = 3
         
         self.logger = logger.bind(worker_id=worker_id, channel=channel_url)
         
     async def start(self):
-        """Запуск основного воркера"""
+        """Запуск воркера"""
         self.running = True
-        self.logger.info(f"🚀 Последовательный воркер {self.worker_id} запущен для канала {self.channel_url}")
+        self.logger.info(f"🚀 Воркер {self.worker_id} запущен для канала {self.channel_url}")
         
         while self.running:
             try:
@@ -51,22 +45,8 @@ class ChannelWorker:
                     timeout=10.0
                 )
                 
-                available_accounts = await tg_account_db.get_working_accounts_by_channel(self.channel_guid)
-                if not available_accounts:
-                    self.logger.warning("⚠️ Нет доступных аккаунтов для обработки задачи")
-                    self.task_queue.task_done()
-                    continue
-                
-                # Если есть активные под-воркеры и свободные аккаунты - запускаем новый под-воркер
-                if self.active_sub_workers > 0 and len(available_accounts) > self.active_sub_workers + 1:
-                    if self.active_sub_workers < self.max_sub_workers:
-                        await self._spawn_sub_worker(task)
-                        self.task_queue.task_done()
-                        continue
-                
-                # Обрабатываем задачу в основном потоке
                 self.current_task = task
-                await self._process_channel_task_with_norms(task)
+                await self._process_channel_task_with_rotation(task)
                 self.task_queue.task_done()
                 self.processed_count += 1
                 self.current_task = None
@@ -79,53 +59,10 @@ class ChannelWorker:
                 self.current_task = None
                 await asyncio.sleep(1)
     
-    async def _spawn_sub_worker(self, task: ChannelTask):
-        """Запускает под-воркер для обработки задачи"""
-        if self.active_sub_workers >= self.max_sub_workers:
-            return False
-            
-        sub_worker_id = len(self.sub_workers) + 1
-        sub_logger = self.logger.bind(sub_worker=sub_worker_id)
-        
-        sub_logger.info(f"🔥 Запускаю под-воркер {sub_worker_id} для сообщения {task.message_id}")
-        
-        sub_task = asyncio.create_task(
-            self._sub_worker_process(task, sub_worker_id, sub_logger)
-        )
-        
-        self.sub_workers[f"sub_{sub_worker_id}"] = sub_task
-        self.active_sub_workers += 1
-        
-        asyncio.create_task(self._cleanup_sub_worker(f"sub_{sub_worker_id}", sub_task))
-        return True
-    
-    async def _cleanup_sub_worker(self, sub_worker_key: str, sub_task: asyncio.Task):
-        """Очищает завершенный под-воркер"""
-        try:
-            await sub_task
-        except Exception as e:
-            self.logger.error(f"Ошибка в под-воркере {sub_worker_key}: {e}")
-        finally:
-            if sub_worker_key in self.sub_workers:
-                del self.sub_workers[sub_worker_key]
-                self.active_sub_workers -= 1
-                self.logger.debug(f"🧹 Под-воркер {sub_worker_key} завершен")
-    
-    async def _sub_worker_process(self, task: ChannelTask, sub_worker_id: int, sub_logger):
-        """Процесс под-воркера"""
-        try:
-            sub_logger.info(f"🎯 Под-воркер {sub_worker_id} обрабатывает сообщение {task.message_id}")
-            await self._process_channel_task_with_norms(task, sub_logger)
-            self.processed_count += 1
-            sub_logger.success(f"✅ Под-воркер {sub_worker_id} завершил обработку {task.message_id}")
-        except Exception as e:
-            self.error_count += 1
-            sub_logger.error(f"❌ Ошибка в под-воркере {sub_worker_id}: {e}")
-    
-    async def _process_channel_task_with_norms(self, task: ChannelTask, custom_logger=None):
-        """Обработка с учетом норм репостов и ротацией аккаунтов"""
-        task_logger = custom_logger or self.logger
+    async def _process_channel_task_with_rotation(self, task: ChannelTask):
+        """ИСПРАВЛЕННАЯ обработка с ротацией аккаунтов"""
         start_time = datetime.now()
+        task_logger = self.logger.bind(msg_id=task.message_id)
         
         try:
             # Получаем данные канала
@@ -145,13 +82,10 @@ class ChannelWorker:
             try:
                 max_groups = await json_settings.async_get_attribute("max_groups_per_post")
             except:
-                max_groups = 15  # Уменьшили с 25 до 15
+                max_groups = 20
             
-            if len(all_groups) > max_groups:
-                selected_groups = random.sample(all_groups, max_groups)
-                task_logger.info(f"📊 Выбрано {max_groups} из {len(all_groups)} групп")
-            else:
-                selected_groups = all_groups
+            selected_groups = random.sample(all_groups, min(max_groups, len(all_groups)))
+            task_logger.info(f"📊 Выбрано {len(selected_groups)} из {len(all_groups)} групп")
             
             # Получаем настройки
             try:
@@ -162,34 +96,26 @@ class ChannelWorker:
             except:
                 number_reposts_before_pause = 15
                 pause_after_rate_reposts = 3600
-                delay_between_groups = 15  # Увеличили с 5 до 15 секунд
+                delay_between_groups = 10
                 check_stop_links = True
             
-            task_logger.info(f"📨 Обработка {len(selected_groups)} групп с нормой {number_reposts_before_pause} репостов")
-            task_logger.info(f"⏱️ Задержка между группами: {delay_between_groups}с")
+            task_logger.info(f"⚙️ Настройки: норма={number_reposts_before_pause}, пауза={pause_after_rate_reposts//60}мин, задержка={delay_between_groups}с")
             
-            # 🎯 ОСНОВНОЙ ЦИКЛ С РОТАЦИЕЙ АККАУНТОВ
-            successful_reposts = 0
-            current_account = None
-            telegram_client = None
-            counter_reposts_current_account = 0
-            
-            # Получаем рабочие аккаунты
-            working_accounts = await tg_account_db.get_working_accounts_by_channel(self.channel_guid)
-            if not working_accounts:
-                task_logger.error("Нет рабочих аккаунтов")
+            # Получаем все доступные аккаунты
+            all_accounts = await tg_account_db.get_working_accounts_by_channel(self.channel_guid)
+            if not all_accounts:
+                task_logger.error("❌ Нет рабочих аккаунтов")
                 return
             
-            account_index = 0
-            processed_groups = 0
+            task_logger.info(f"👥 Доступно {len(all_accounts)} рабочих аккаунтов")
             
             # Проверяем стоп-ссылки один раз в начале
-            if check_stop_links and working_accounts:
-                temp_client = await telegram_utils2.create_tg_client(working_accounts[0])
+            if check_stop_links and all_accounts:
+                temp_client = await telegram_utils2.create_tg_client(all_accounts[0])
                 if temp_client:
                     try:
                         stop_links_found = await self._check_stop_links_in_message(
-                            temp_client, channel, task.message_id, working_accounts[:3], task_logger
+                            temp_client, channel, task.message_id, all_accounts[:3], task_logger
                         )
                         if stop_links_found:
                             task_logger.info("🛑 Найдены стоп-ссылки, обработка завершена")
@@ -197,73 +123,96 @@ class ChannelWorker:
                     finally:
                         await temp_client.disconnect()
             
-            # Основной цикл обработки групп
+            # 🎯 ОСНОВНОЙ ЦИКЛ С РОТАЦИЕЙ
+            successful_reposts = 0
+            current_account = None
+            current_client = None
+            current_reposts_count = 0
+            account_index = 0
+            
             for i, group in enumerate(selected_groups, 1):
+                group_logger = task_logger.bind(group_idx=i, total=len(selected_groups))
+                
                 try:
                     # 🔄 ПРОВЕРЯЕМ НУЖНА ЛИ СМЕНА АККАУНТА
-                    if (current_account is None or 
-                        counter_reposts_current_account >= number_reposts_before_pause):
+                    need_new_account = (
+                        current_account is None or 
+                        current_reposts_count >= number_reposts_before_pause or
+                        current_client is None
+                    )
+                    
+                    if need_new_account:
+                        # Закрываем предыдущий клиент
+                        if current_client:
+                            try:
+                                await current_client.disconnect()
+                                group_logger.debug("🔌 Предыдущий клиент отключен")
+                            except:
+                                pass
+                            current_client = None
                         
-                        if current_account:
-                            # Ставим предыдущий аккаунт на паузу
-                            task_logger.info(f"⏸️ Аккаунт +{current_account.phone_number} достиг нормы ({counter_reposts_current_account}), ставлю на паузу")
+                        # Если достигли лимита - ставим аккаунт на паузу
+                        if current_account and current_reposts_count >= number_reposts_before_pause:
+                            group_logger.info(f"⏸️ Аккаунт +{current_account.phone_number} достиг нормы ({current_reposts_count}), ставлю на паузу")
                             await tg_account_db.add_pause(current_account, pause_after_rate_reposts)
-                            
-                            # Закрываем клиент
-                            if telegram_client:
-                                await telegram_client.disconnect()
-                                telegram_client = None
                         
                         # Ищем следующий доступный аккаунт
                         next_account = None
                         attempts = 0
-                        while attempts < len(working_accounts) and not next_account:
-                            if account_index >= len(working_accounts):
-                                account_index = 0
+                        
+                        while attempts < len(all_accounts) and not next_account:
+                            if account_index >= len(all_accounts):
+                                account_index = 0  # Начинаем сначала
                             
-                            candidate = working_accounts[account_index]
+                            candidate = all_accounts[account_index]
                             
-                            # Проверяем что аккаунт не на паузе
+                            # Проверяем что аккаунт не на паузе и рабочий
+                            if candidate.status != "WORKING":
+                                account_index += 1
+                                attempts += 1
+                                continue
+                            
+                            # Проверяем паузу
                             if candidate.last_datetime_pause and candidate.pause_in_seconds:
                                 if not await tg_account_db.has_pause_paused(candidate):
+                                    group_logger.debug(f"Аккаунт +{candidate.phone_number} еще на паузе")
                                     account_index += 1
                                     attempts += 1
                                     continue
                             
-                            next_account = candidate
-                            account_index += 1
-                            break
+                            # Пытаемся создать клиент
+                            test_client = await telegram_utils2.create_tg_client(candidate)
+                            if test_client:
+                                next_account = candidate
+                                current_client = test_client
+                                break
+                            else:
+                                group_logger.warning(f"Не удалось создать клиент для +{candidate.phone_number}")
+                                account_index += 1
+                                attempts += 1
                         
-                        if not next_account:
-                            task_logger.warning("❌ Все аккаунты на паузе или недоступны")
+                        if not next_account or not current_client:
+                            group_logger.error("❌ Нет доступных аккаунтов для работы")
                             break
-                        
-                        # Создаем клиент для нового аккаунта
-                        telegram_client = await telegram_utils2.create_tg_client(next_account)
-                        if not telegram_client:
-                            task_logger.error(f"❌ Не удалось создать клиент для +{next_account.phone_number}")
-                            continue
                         
                         current_account = next_account
-                        counter_reposts_current_account = 0
-                        task_logger.info(f"🔄 Переключился на аккаунт: +{current_account.phone_number}")
+                        current_reposts_count = 0
+                        account_index += 1  # Переходим к следующему для будущих смен
+                        
+                        group_logger.info(f"🔄 Активирован аккаунт: +{current_account.phone_number}")
                     
-                    # Проверяем кэш групп для текущего аккаунта
+                    # Проверяем кэш групп
                     phone_number = current_account.phone_number
                     if phone_number not in self.account_groups_cache:
                         self.account_groups_cache[phone_number] = set()
                     
-                    group_logger = task_logger.bind(group_idx=i, total_groups=len(selected_groups))
-                    group_logger.info(f"🎯 Обрабатываю группу {i}/{len(selected_groups)}: {group.url}")
+                    group_logger.info(f"🎯 Обрабатываю группу: {group.url}")
                     
-                    # 🚀 ПРОВЕРЯЕМ СОСТОИТ ЛИ УЖЕ В ГРУППЕ
+                    # Проверяем, нужно ли вступать в группу
                     already_joined = group.url in self.account_groups_cache[phone_number]
-                    if already_joined:
-                        group_logger.info(f"✅ Аккаунт уже в группе {group.url}, пропускаю вступление")
-                    else:
-                        # Пытаемся вступить в группу
+                    if not already_joined:
                         join_success = await telegram_utils2.checking_and_joining_if_possible(
-                            telegram_client=telegram_client,
+                            telegram_client=current_client,
                             url=group.url,
                             channel=channel
                         )
@@ -273,14 +222,16 @@ class ChannelWorker:
                             await asyncio.sleep(delay_between_groups)
                             continue
                         
-                        # Добавляем в кэш успешно вступленную группу
+                        # Добавляем в кэш
                         self.account_groups_cache[phone_number].add(group.url)
-                        group_logger.info(f"➕ Добавил группу {group.url} в кэш аккаунта")
+                        group_logger.debug(f"➕ Группа добавлена в кэш")
+                    else:
+                        group_logger.debug(f"✅ Уже участник группы")
                     
                     # Делаем репост
                     repost_success = await telegram_utils2.repost_in_group_by_message_id(
                         message_id=task.message_id,
-                        telegram_client=telegram_client,
+                        telegram_client=current_client,
                         telegram_channel_id=channel.telegram_channel_id,
                         channel_url=channel.url,
                         group_url=group.url
@@ -288,8 +239,8 @@ class ChannelWorker:
                     
                     if repost_success:
                         successful_reposts += 1
-                        counter_reposts_current_account += 1  # 🎯 УВЕЛИЧИВАЕМ СЧЕТЧИК ПОСЛЕ КАЖДОЙ ГРУППЫ
-                        group_logger.success(f"✅ Репост в {group.url} (репост #{counter_reposts_current_account})")
+                        current_reposts_count += 1  # 🎯 УВЕЛИЧИВАЕМ СЧЕТЧИК
+                        group_logger.success(f"✅ Репост успешен (#{current_reposts_count} у аккаунта)")
                         
                         # Записываем в БД
                         try:
@@ -305,23 +256,20 @@ class ChannelWorker:
                         except Exception as db_error:
                             group_logger.debug(f"Ошибка записи в БД: {db_error}")
                     else:
-                        group_logger.warning(f"❌ Репост в {group.url} не удался")
-                    
-                    processed_groups += 1
+                        group_logger.warning(f"❌ Репост не удался")
                     
                     # Пауза между группами (не после последней)
                     if i < len(selected_groups):
-                        group_logger.debug(f"⏱️ Пауза {delay_between_groups}с до следующей группы")
                         await asyncio.sleep(delay_between_groups)
                         
                 except Exception as group_error:
                     group_logger.error(f"Ошибка при обработке группы {group.url}: {group_error}")
-                    await asyncio.sleep(delay_between_groups)
+                    await asyncio.sleep(delay_between_groups // 2)
             
             # Закрываем клиент
-            if telegram_client:
+            if current_client:
                 try:
-                    await telegram_client.disconnect()
+                    await current_client.disconnect()
                     task_logger.debug("🔌 Клиент отключен")
                 except:
                     pass
@@ -330,14 +278,14 @@ class ChannelWorker:
             processing_time = (datetime.now() - start_time).total_seconds()
             success_rate = (successful_reposts / len(selected_groups) * 100) if selected_groups else 0
             
-            task_logger.success(f"🎉 Задача завершена: {successful_reposts}/{len(selected_groups)} ({success_rate:.1f}%) за {processing_time:.1f}с")
+            task_logger.success(f"🎉 Обработка завершена: {successful_reposts}/{len(selected_groups)} ({success_rate:.1f}%) за {processing_time:.1f}с")
             
             if current_account:
-                task_logger.info(f"📊 Итого репостов у аккаунта +{current_account.phone_number}: {counter_reposts_current_account}")
+                task_logger.info(f"📊 Репостов у аккаунта +{current_account.phone_number}: {current_reposts_count}")
                 
         except Exception as e:
             processing_time = (datetime.now() - start_time).total_seconds()
-            task_logger.error(f"❌ Критическая ошибка при обработке за {processing_time:.1f}с: {e}")
+            task_logger.error(f"❌ Критическая ошибка: {e}")
             self.error_count += 1
     
     async def _check_stop_links_in_message(self, telegram_client, channel, message_id, tg_accounts, task_logger) -> bool:
@@ -388,9 +336,6 @@ class ChannelWorker:
             queue_size = self.task_queue.qsize()
             self.logger.info(f"➕ Сообщение {message_id} добавлено в очередь. Размер: {queue_size}")
             
-            if queue_size > 1:
-                self.logger.info(f"📋 В очереди {queue_size} задач, активно под-воркеров: {self.active_sub_workers}")
-            
             return True
             
         except asyncio.QueueFull:
@@ -403,12 +348,6 @@ class ChannelWorker:
     def stop(self):
         """Остановка воркера"""
         self.running = False
-        
-        # Отменяем все под-воркеры
-        for sub_worker_key, sub_task in self.sub_workers.items():
-            if not sub_task.done():
-                sub_task.cancel()
-                
         self.logger.info(f"🛑 Воркер {self.worker_id} остановлен. Обработано: {self.processed_count}")
     
     def get_stats(self) -> dict:
@@ -421,8 +360,6 @@ class ChannelWorker:
             'error_count': self.error_count,
             'running': self.running,
             'queue_size': self.task_queue.qsize(),
-            'active_sub_workers': self.active_sub_workers,
-            'max_sub_workers': self.max_sub_workers,
             'cached_accounts': len(self.account_groups_cache),
             'total_cached_groups': sum(len(groups) for groups in self.account_groups_cache.values()),
             'current_task': {
@@ -434,7 +371,7 @@ class ChannelWorker:
 
 
 class ChannelProcessor:
-    """Менеджер последовательных воркеров каналов"""
+    """Менеджер воркеров каналов с исправленной ротацией"""
     
     def __init__(self):
         self.channel_workers: Dict[str, ChannelWorker] = {}
@@ -445,7 +382,7 @@ class ChannelProcessor:
         # Защита от дублей
         self.processing_messages: Dict[str, Set[tuple]] = {}
         
-        logger.info("🏗️ Инициализирован процессор с нормами и кэшированием групп")
+        logger.info("🏗️ Инициализирован процессор с исправленной ротацией аккаунтов")
     
     async def _channel_has_accounts(self, channel_guid: str) -> bool:
         """Проверяет, есть ли у канала рабочие аккаунты"""
@@ -486,11 +423,11 @@ class ChannelProcessor:
                 self.worker_tasks[channel_guid] = task
                 
                 active_channels += 1
-                logger.info(f"✅ Воркер с нормами создан для канала {channel.url}")
+                logger.info(f"✅ Воркер создан для канала {channel.url}")
             else:
                 logger.info(f"⏭️ Канал {channel.url} пропущен - нет аккаунтов")
         
-        logger.success(f"✅ Запущено {active_channels} воркеров с системой норм и кэшированием")
+        logger.success(f"✅ Запущено {active_channels} воркеров с исправленной ротацией")
     
     async def ensure_worker_for_channel(self, channel_guid: str) -> bool:
         """Создает воркер для канала если нужно"""
@@ -518,7 +455,7 @@ class ChannelProcessor:
             task = asyncio.create_task(worker.start())
             self.worker_tasks[channel_guid] = task
             
-            logger.success(f"🎉 Создан новый воркер с нормами для канала {channel.url}")
+            logger.success(f"🎉 Создан новый воркер для канала {channel.url}")
             return True
             
         except Exception as e:
@@ -592,7 +529,7 @@ class ChannelProcessor:
                 # Планируем удаление из защиты от дублей
                 asyncio.create_task(self._cleanup_processed_message(channel_guid, message_key, delay=3600))
                 
-                logger.info(f"✅ Сообщение {message_id} передано воркеру с нормами канала {channel.url}")
+                logger.info(f"✅ Сообщение {message_id} передано воркеру с ротацией канала {channel.url}")
                 return True
             
             return False
@@ -629,7 +566,6 @@ class ChannelProcessor:
         
         active_channels = sum(1 for w in self.channel_workers.values() if w.current_task is not None)
         total_queue_size = sum(w.task_queue.qsize() for w in self.channel_workers.values())
-        total_sub_workers = sum(w.active_sub_workers for w in self.channel_workers.values())
         total_cached_groups = sum(w.get_stats().get('total_cached_groups', 0) for w in self.channel_workers.values())
         
         return {
@@ -638,7 +574,6 @@ class ChannelProcessor:
             'channels_count': len(self.channel_workers),
             'active_channels': active_channels,
             'total_queue_size': total_queue_size,
-            'total_sub_workers': total_sub_workers,
             'total_cached_groups': total_cached_groups,
             'total_processed': total_processed,
             'total_errors': total_errors,
@@ -652,7 +587,7 @@ class ChannelProcessor:
         if not self.running:
             return
             
-        logger.info("🛑 Останавливаю все воркеры с нормами...")
+        logger.info("🛑 Останавливаю все воркеры...")
         
         # Останавливаем воркеры
         for worker in self.channel_workers.values():
@@ -681,7 +616,7 @@ class ChannelProcessor:
         
         # Финальная статистика
         stats = self.get_stats()
-        logger.success(f"✅ Процессор с нормами остановлен. Каналов: {stats['channels_count']}, обработано: {stats['total_processed']}")
+        logger.success(f"✅ Процессор остановлен. Каналов: {stats['channels_count']}, обработано: {stats['total_processed']}")
         
         # Очистка
         self.channel_workers.clear()
@@ -689,5 +624,5 @@ class ChannelProcessor:
         self.processing_messages.clear()
 
 
-# Глобальный экземпляр
+# Глобальный экземпляр - исправляем имя переменной
 channel_processor = ChannelProcessor()
