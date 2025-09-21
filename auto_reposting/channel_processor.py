@@ -18,6 +18,8 @@ class ChannelTask:
 
 
 class ChannelWorker:
+    """Воркер с ПОСТОЯННЫМ состоянием ротации аккаунтов"""
+    
     def __init__(self, channel_guid: str, channel_url: str, worker_id: int):
         self.channel_guid = channel_guid
         self.channel_url = channel_url
@@ -27,6 +29,13 @@ class ChannelWorker:
         self.processed_count = 0
         self.error_count = 0
         self.current_task = None
+        
+        # 🎯 ПОСТОЯННОЕ СОСТОЯНИЕ РОТАЦИИ (НЕ ОБНУЛЯЕТСЯ!)
+        self.current_account_index = 0
+        self.current_account_reposts = 0
+        self.current_account = None
+        self.available_accounts = []
+        self.last_accounts_refresh = None
         
         # Кэш групп для каждого аккаунта
         self.account_groups_cache: Dict[int, Set[str]] = {}  
@@ -59,234 +68,118 @@ class ChannelWorker:
                 self.current_task = None
                 await asyncio.sleep(1)
     
-    async def _process_channel_task_with_rotation(self, task: ChannelTask):
-        """ИСПРАВЛЕННАЯ обработка с ротацией аккаунтов"""
-        start_time = datetime.now()
-        task_logger = self.logger.bind(msg_id=task.message_id)
+    async def refresh_available_accounts(self):
+        """Обновляет список доступных аккаунтов (только если прошло время)"""
+        now = datetime.now()
         
+        # Обновляем список аккаунтов каждые 5 минут или при первом запуске
+        if (self.last_accounts_refresh is None or 
+            (now - self.last_accounts_refresh).total_seconds() > 300):
+            
+            self.available_accounts = await tg_account_db.get_working_accounts_by_channel(self.channel_guid)
+            self.last_accounts_refresh = now
+            
+            self.logger.info(f"🔄 Обновлен список аккаунтов: {len(self.available_accounts)} доступно")
+            
+            # Если текущий индекс больше чем аккаунтов - сбрасываем
+            if self.current_account_index >= len(self.available_accounts):
+                self.current_account_index = 0
+                self.current_account_reposts = 0
+                self.logger.info("🔄 Сброшен индекс аккаунтов")
+    
+    async def get_current_working_account(self):
+        await self.refresh_available_accounts()
+        
+        if not self.available_accounts:
+            self.logger.error("❌ Нет доступных аккаунтов")
+            return None
+        
+        # Получаем настройки
         try:
-            # Получаем данные канала
-            channel = await channel_db.get_channel_by_telegram_channel_id(task.channel_id)
-            if not channel:
-                task_logger.error(f"Канал {task.channel_id} не найден в БД")
-                return
-            
-            # Получаем группы канала
-            from core.models import group as group_db
-            all_groups = await group_db.get_all_groups_by_channel_guid(self.channel_guid)
-            if not all_groups:
-                task_logger.warning("Нет групп для репостинга")
-                return
-            
-            # Ограничиваем количество групп
-            try:
-                max_groups = await json_settings.async_get_attribute("max_groups_per_post")
-            except:
-                max_groups = 20
-            
-            selected_groups = random.sample(all_groups, min(max_groups, len(all_groups)))
-            task_logger.info(f"📊 Выбрано {len(selected_groups)} из {len(all_groups)} групп")
-            
-            # Получаем настройки
-            try:
-                number_reposts_before_pause = await json_settings.async_get_attribute("number_reposts_before_pause")
-                pause_after_rate_reposts = await json_settings.async_get_attribute("pause_after_rate_reposts")
-                delay_between_groups = await json_settings.async_get_attribute("delay_between_groups")
-                check_stop_links = await json_settings.async_get_attribute("check_stop_links")
-            except:
-                number_reposts_before_pause = 15
-                pause_after_rate_reposts = 3600
-                delay_between_groups = 10
-                check_stop_links = True
-            
-            task_logger.info(f"⚙️ Настройки: норма={number_reposts_before_pause}, пауза={pause_after_rate_reposts//60}мин, задержка={delay_between_groups}с")
-            
-            # Получаем все доступные аккаунты
-            all_accounts = await tg_account_db.get_working_accounts_by_channel(self.channel_guid)
-            if not all_accounts:
-                task_logger.error("❌ Нет рабочих аккаунтов")
-                return
-            
-            task_logger.info(f"👥 Доступно {len(all_accounts)} рабочих аккаунтов")
-            
-            # Проверяем стоп-ссылки один раз в начале
-            if check_stop_links and all_accounts:
-                temp_client = await telegram_utils2.create_tg_client(all_accounts[0])
-                if temp_client:
-                    try:
-                        stop_links_found = await self._check_stop_links_in_message(
-                            temp_client, channel, task.message_id, all_accounts[:3], task_logger
-                        )
-                        if stop_links_found:
-                            task_logger.info("🛑 Найдены стоп-ссылки, обработка завершена")
-                            return
-                    finally:
-                        await temp_client.disconnect()
-            
-            # 🎯 ОСНОВНОЙ ЦИКЛ С РОТАЦИЕЙ
-            successful_reposts = 0
-            current_account = None
-            current_client = None
-            current_reposts_count = 0
-            account_index = 0
-            
-            for i, group in enumerate(selected_groups, 1):
-                group_logger = task_logger.bind(group_idx=i, total=len(selected_groups))
+            number_reposts_before_pause = await json_settings.async_get_attribute("number_reposts_before_pause")
+            pause_after_rate_reposts = await json_settings.async_get_attribute("pause_after_rate_reposts")
+        except:
+            number_reposts_before_pause = 15
+            pause_after_rate_reposts = 3600
+        
+        # 🔄 ПРОВЕРЯЕМ НУЖНО ЛИ ПЕРЕКЛЮЧИТЬ АККАУНТ
+        if self.current_account_reposts >= number_reposts_before_pause:
+            # Ставим текущий аккаунт на паузу
+            if (self.current_account_index < len(self.available_accounts) and 
+                self.current_account_reposts > 0):
                 
-                try:
-                    # 🔄 ПРОВЕРЯЕМ НУЖНА ЛИ СМЕНА АККАУНТА
-                    need_new_account = (
-                        current_account is None or 
-                        current_reposts_count >= number_reposts_before_pause or
-                        current_client is None
-                    )
-                    
-                    if need_new_account:
-                        # Закрываем предыдущий клиент
-                        if current_client:
-                            try:
-                                await current_client.disconnect()
-                                group_logger.debug("🔌 Предыдущий клиент отключен")
-                            except:
-                                pass
-                            current_client = None
-                        
-                        # Если достигли лимита - ставим аккаунт на паузу
-                        if current_account and current_reposts_count >= number_reposts_before_pause:
-                            group_logger.info(f"⏸️ Аккаунт +{current_account.phone_number} достиг нормы ({current_reposts_count}), ставлю на паузу")
-                            await tg_account_db.add_pause(current_account, pause_after_rate_reposts)
-                        
-                        # Ищем следующий доступный аккаунт
-                        next_account = None
-                        attempts = 0
-                        
-                        while attempts < len(all_accounts) and not next_account:
-                            if account_index >= len(all_accounts):
-                                account_index = 0  # Начинаем сначала
-                            
-                            candidate = all_accounts[account_index]
-                            
-                            # Проверяем что аккаунт не на паузе и рабочий
-                            if candidate.status != "WORKING":
-                                account_index += 1
-                                attempts += 1
-                                continue
-                            
-                            # Проверяем паузу
-                            if candidate.last_datetime_pause and candidate.pause_in_seconds:
-                                if not await tg_account_db.has_pause_paused(candidate):
-                                    group_logger.debug(f"Аккаунт +{candidate.phone_number} еще на паузе")
-                                    account_index += 1
-                                    attempts += 1
-                                    continue
-                            
-                            # Пытаемся создать клиент
-                            test_client = await telegram_utils2.create_tg_client(candidate)
-                            if test_client:
-                                next_account = candidate
-                                current_client = test_client
-                                break
-                            else:
-                                group_logger.warning(f"Не удалось создать клиент для +{candidate.phone_number}")
-                                account_index += 1
-                                attempts += 1
-                        
-                        if not next_account or not current_client:
-                            group_logger.error("❌ Нет доступных аккаунтов для работы")
-                            break
-                        
-                        current_account = next_account
-                        current_reposts_count = 0
-                        account_index += 1  # Переходим к следующему для будущих смен
-                        
-                        group_logger.info(f"🔄 Активирован аккаунт: +{current_account.phone_number}")
-                    
-                    # Проверяем кэш групп
-                    phone_number = current_account.phone_number
-                    if phone_number not in self.account_groups_cache:
-                        self.account_groups_cache[phone_number] = set()
-                    
-                    group_logger.info(f"🎯 Обрабатываю группу: {group.url}")
-                    
-                    # Проверяем, нужно ли вступать в группу
-                    already_joined = group.url in self.account_groups_cache[phone_number]
-                    if not already_joined:
-                        join_success = await telegram_utils2.checking_and_joining_if_possible(
-                            telegram_client=current_client,
-                            url=group.url,
-                            channel=channel
-                        )
-                        
-                        if not join_success:
-                            group_logger.warning(f"⚠️ Не удалось вступить в группу {group.url}")
-                            await asyncio.sleep(delay_between_groups)
-                            continue
-                        
-                        # Добавляем в кэш
-                        self.account_groups_cache[phone_number].add(group.url)
-                        group_logger.debug(f"➕ Группа добавлена в кэш")
-                    else:
-                        group_logger.debug(f"✅ Уже участник группы")
-                    
-                    # Делаем репост
-                    repost_success = await telegram_utils2.repost_in_group_by_message_id(
-                        message_id=task.message_id,
-                        telegram_client=current_client,
-                        telegram_channel_id=channel.telegram_channel_id,
-                        channel_url=channel.url,
-                        group_url=group.url
-                    )
-                    
-                    if repost_success:
-                        successful_reposts += 1
-                        current_reposts_count += 1  # 🎯 УВЕЛИЧИВАЕМ СЧЕТЧИК
-                        group_logger.success(f"✅ Репост успешен (#{current_reposts_count} у аккаунта)")
-                        
-                        # Записываем в БД
-                        try:
-                            from core.schemas import repost as repost_schemas
-                            from core.models import repost as repost_db
-                            await repost_db.create_repost(
-                                repost_in=repost_schemas.RepostCreate(
-                                    channel_guid=channel.guid,
-                                    repost_message_id=task.message_id,
-                                    created_at=datetime.now().date()
-                                )
-                            )
-                        except Exception as db_error:
-                            group_logger.debug(f"Ошибка записи в БД: {db_error}")
-                    else:
-                        group_logger.warning(f"❌ Репост не удался")
-                    
-                    # Пауза между группами (не после последней)
-                    if i < len(selected_groups):
-                        await asyncio.sleep(delay_between_groups)
-                        
-                except Exception as group_error:
-                    group_logger.error(f"Ошибка при обработке группы {group.url}: {group_error}")
-                    await asyncio.sleep(delay_between_groups // 2)
-            
-            # Закрываем клиент
-            if current_client:
-                try:
-                    await current_client.disconnect()
-                    task_logger.debug("🔌 Клиент отключен")
-                except:
-                    pass
-            
-            # Финальная статистика
-            processing_time = (datetime.now() - start_time).total_seconds()
-            success_rate = (successful_reposts / len(selected_groups) * 100) if selected_groups else 0
-            
-            task_logger.success(f"🎉 Обработка завершена: {successful_reposts}/{len(selected_groups)} ({success_rate:.1f}%) за {processing_time:.1f}с")
-            
-            if current_account:
-                task_logger.info(f"📊 Репостов у аккаунта +{current_account.phone_number}: {current_reposts_count}")
+                old_account = self.available_accounts[self.current_account_index]
+                await tg_account_db.add_pause(old_account, pause_after_rate_reposts)
                 
-        except Exception as e:
-            processing_time = (datetime.now() - start_time).total_seconds()
-            task_logger.error(f"❌ Критическая ошибка: {e}")
-            self.error_count += 1
+                self.logger.warning(f"⏸️ Аккаунт +{old_account.phone_number} достиг лимита ({self.current_account_reposts}), пауза {pause_after_rate_reposts//60} мин")
+            
+            # Переключаемся на следующий аккаунт
+            self.current_account_index += 1
+            self.current_account_reposts = 0
+        
+        # 🆕 ПРОВЕРЯЕМ ТЕКУЩИЙ АККАУНТ НА FROZEN_METHOD_INVALID
+        max_attempts = len(self.available_accounts)
+        attempts = 0
+        
+        while attempts < max_attempts:
+            # Если индекс выходит за границы - начинаем сначала
+            if self.current_account_index >= len(self.available_accounts):
+                self.current_account_index = 0
+                
+            candidate_account = self.available_accounts[self.current_account_index]
+            
+            # Простая проверка - пробуем создать клиент
+            test_client = await telegram_utils2.create_tg_client(candidate_account)
+            if test_client:
+                try:
+                    # Быстрая проверка доступности методов
+                    async with test_client:
+                        await test_client.get_me()
+                    
+                    self.current_account = candidate_account
+                    self.logger.info(f"✅ Выбран аккаунт +{candidate_account.phone_number} (попытка {attempts + 1})")
+                    return candidate_account
+                    
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Аккаунт +{candidate_account.phone_number} недоступен: {e}")
+                    # Переходим к следующему
+                    self.current_account_index += 1
+                    attempts += 1
+                    continue
+            else:
+                self.logger.warning(f"⚠️ Не удалось создать клиент для +{candidate_account.phone_number}")
+                self.current_account_index += 1
+                attempts += 1
+                continue
+        
+        # Если никого не нашли - ждем и пробуем снова
+        self.logger.error("❌ Все аккаунты недоступны, жду 5 минут")
+        await asyncio.sleep(300)
+        await self.refresh_available_accounts()
+        self.current_account_index = 0
+        
+        return None
+
+
+    async def handle_account_error(self, error_message: str):
+        if self.current_account:
+            self.logger.warning(f"🔄 Ошибка у аккаунта +{self.current_account.phone_number}: {error_message}")
+            
+            # Если FROZEN_METHOD_INVALID - переключаемся немедленно
+            if "FROZEN_METHOD_INVALID" in error_message:
+                self.logger.warning(f"🧊 У аккаунта +{self.current_account.phone_number} заморожены методы, переключаюсь")
+                self.current_account_index += 1
+                self.current_account_reposts = 0  # Сбрасываем счетчик только при принудительном переключении
+                return await self.get_current_working_account()
+        
+        return self.current_account
+
+    async def increment_account_reposts(self):
+        """Увеличивает счетчик репостов текущего аккаунта"""
+        self.current_account_reposts += 1
+        
+        if self.current_account:
+            self.logger.debug(f"📊 Репостов у +{self.current_account.phone_number}: {self.current_account_reposts}")
     
     async def _check_stop_links_in_message(self, telegram_client, channel, message_id, tg_accounts, task_logger) -> bool:
         """Проверяет стоп-ссылки в сообщении"""
@@ -321,6 +214,177 @@ class ChannelWorker:
         except Exception as e:
             task_logger.error(f"Ошибка при проверке стоп-ссылок: {e}")
             return False
+    
+    async def _process_channel_task_with_rotation(self, task: ChannelTask):
+        start_time = datetime.now()
+        task_logger = self.logger.bind(msg_id=task.message_id)
+        
+        try:
+            # Получаем данные канала
+            channel = await channel_db.get_channel_by_telegram_channel_id(task.channel_id)
+            if not channel:
+                task_logger.error(f"Канал {task.channel_id} не найден в БД")
+                return
+            
+            # Получаем группы канала
+            from core.models import group as group_db
+            all_groups = await group_db.get_all_groups_by_channel_guid(self.channel_guid)
+            if not all_groups:
+                task_logger.warning("Нет групп для репостинга")
+                return
+            
+            # Ограничиваем количество групп
+            try:
+                max_groups = await json_settings.async_get_attribute("max_groups_per_post")
+                delay_between_groups = await json_settings.async_get_attribute("delay_between_groups")
+                check_stop_links = await json_settings.async_get_attribute("check_stop_links")
+            except:
+                max_groups = 20
+                delay_between_groups = 120
+                check_stop_links = True
+            
+            selected_groups = random.sample(all_groups, min(max_groups, len(all_groups)))
+            task_logger.info(f"📊 Выбрано {len(selected_groups)} из {len(all_groups)} групп")
+            
+            # Проверяем стоп-ссылки (пропускаем если есть проблемы)
+            if check_stop_links:
+                current_account = await self.get_current_working_account()
+                if current_account:
+                    temp_client = await telegram_utils2.create_tg_client(current_account)
+                    if temp_client:
+                        try:
+                            stop_links_found = await self._check_stop_links_in_message(
+                                temp_client, channel, task.message_id, [current_account], task_logger
+                            )
+                            if stop_links_found:
+                                task_logger.info("🛑 Найдены стоп-ссылки, обработка завершена")
+                                return
+                        except Exception as e:
+                            task_logger.warning(f"⚠️ Ошибка проверки стоп-ссылок: {e}")
+                        finally:
+                            await temp_client.disconnect()
+            
+            # 🚀 ГЛАВНЫЙ ЦИКЛ С АВТОПЕРЕКЛЮЧЕНИЕМ ПРИ ОШИБКАХ
+            successful_reposts = 0
+            
+            for i, group in enumerate(selected_groups, 1):
+                group_logger = task_logger.bind(group_idx=i, total=len(selected_groups))
+                
+                try:
+                    # Получаем текущий рабочий аккаунт
+                    working_account = await self.get_current_working_account()
+                    if not working_account:
+                        group_logger.error("❌ Нет доступных аккаунтов")
+                        break
+                    
+                    group_logger.info(f"🎯 Группа {i}: {group.url} (аккаунт +{working_account.phone_number}, репост #{self.current_account_reposts + 1})")
+                    
+                    # 🔄 ПРОБУЕМ НЕСКОЛЬКО АККАУНТОВ ДЛЯ ОДНОЙ ГРУППЫ
+                    repost_success = False
+                    account_attempts = 0
+                    max_account_attempts = min(3, len(self.available_accounts))  # Максимум 3 попытки с разными аккаунтами
+                    
+                    while not repost_success and account_attempts < max_account_attempts:
+                        # Создаем клиент
+                        telegram_client = await telegram_utils2.create_tg_client(working_account)
+                        if not telegram_client:
+                            group_logger.warning(f"⚠️ Не удалось создать клиент для +{working_account.phone_number}")
+                            # Переключаемся на следующий аккаунт
+                            await self.handle_account_error("Client creation failed")
+                            working_account = await self.get_current_working_account()
+                            account_attempts += 1
+                            continue
+                        
+                        try:
+                            # Вступаем в группу
+                            join_success = await telegram_utils2.checking_and_joining_if_possible(
+                                telegram_client=telegram_client,
+                                url=group.url,
+                                channel=channel
+                            )
+                            
+                            if not join_success:
+                                group_logger.warning(f"⚠️ Не удалось вступить в группу {group.url} с +{working_account.phone_number}")
+                                # Проверяем - если это FROZEN_METHOD_INVALID, переключаемся
+                                await self.handle_account_error("Join failed - possibly FROZEN_METHOD_INVALID")
+                                working_account = await self.get_current_working_account()
+                                account_attempts += 1
+                            else:
+                                # Делаем репост
+                                repost_result = await telegram_utils2.repost_in_group_by_message_id(
+                                    message_id=task.message_id,
+                                    telegram_client=telegram_client,
+                                    telegram_channel_id=channel.telegram_channel_id,
+                                    channel_url=channel.url,
+                                    group_url=group.url
+                                )
+                                
+                                if repost_result:
+                                    successful_reposts += 1
+                                    await self.increment_account_reposts()
+                                    repost_success = True
+                                    
+                                    group_logger.success(f"✅ Репост успешен с +{working_account.phone_number} (#{self.current_account_reposts})")
+                                    
+                                    # Записываем в БД
+                                    try:
+                                        from core.schemas import repost as repost_schemas
+                                        from core.models import repost as repost_db
+                                        await repost_db.create_repost(
+                                            repost_in=repost_schemas.RepostCreate(
+                                                channel_guid=channel.guid,
+                                                repost_message_id=task.message_id,
+                                                created_at=datetime.now().date()
+                                            )
+                                        )
+                                    except Exception as db_error:
+                                        group_logger.debug(f"Ошибка записи в БД: {db_error}")
+                                else:
+                                    group_logger.warning(f"❌ Репост не удался с +{working_account.phone_number}")
+                                    account_attempts += 1
+                                    
+                        except Exception as group_error:
+                            error_str = str(group_error)
+                            group_logger.error(f"❌ Ошибка при работе с группой {group.url}: {group_error}")
+                            
+                            # Если FROZEN_METHOD_INVALID - переключаемся на другой аккаунт
+                            if "FROZEN_METHOD_INVALID" in error_str:
+                                await self.handle_account_error(error_str)
+                                working_account = await self.get_current_working_account()
+                            
+                            account_attempts += 1
+                            
+                        finally:
+                            # ОБЯЗАТЕЛЬНО закрываем клиент
+                            try:
+                                await telegram_client.disconnect()
+                            except:
+                                pass
+                    
+                    if not repost_success:
+                        group_logger.warning(f"⚠️ Не удалось сделать репост в {group.url} после {account_attempts} попыток")
+                    
+                    # Пауза между группами
+                    if i < len(selected_groups):
+                        await asyncio.sleep(delay_between_groups)
+                            
+                except Exception as group_error:
+                    group_logger.error(f"Критическая ошибка при обработке группы {group.url}: {group_error}")
+                    await asyncio.sleep(delay_between_groups // 2)
+            
+            # Финальная статистика
+            processing_time = (datetime.now() - start_time).total_seconds()
+            success_rate = (successful_reposts / len(selected_groups) * 100) if selected_groups else 0
+            
+            task_logger.success(f"🎉 Обработка завершена: {successful_reposts}/{len(selected_groups)} ({success_rate:.1f}%) за {processing_time:.1f}с")
+            
+            if self.current_account:
+                task_logger.info(f"📊 Общих репостов у аккаунта +{self.current_account.phone_number}: {self.current_account_reposts}")
+                
+        except Exception as e:
+            processing_time = (datetime.now() - start_time).total_seconds()
+            task_logger.error(f"❌ Критическая ошибка: {e}")
+            self.error_count += 1
     
     async def add_task(self, channel_id: int, message_id: int) -> bool:
         """Добавить задачу в очередь канала"""
@@ -366,7 +430,18 @@ class ChannelWorker:
                 'channel_id': self.current_task.channel_id if self.current_task else None,
                 'message_id': self.current_task.message_id if self.current_task else None,
                 'started_at': self.current_task.timestamp if self.current_task else None
-            } if self.current_task else None
+            } if self.current_task else None,
+            'rotation': self.get_rotation_stats()
+        }
+    
+    def get_rotation_stats(self) -> dict:
+        """Статистика ротации аккаунтов"""
+        return {
+            'current_account_index': self.current_account_index,
+            'current_account_reposts': self.current_account_reposts,
+            'current_account_phone': self.current_account.phone_number if self.current_account else None,
+            'available_accounts_count': len(self.available_accounts),
+            'last_accounts_refresh': self.last_accounts_refresh
         }
 
 
@@ -568,6 +643,10 @@ class ChannelProcessor:
         total_queue_size = sum(w.task_queue.qsize() for w in self.channel_workers.values())
         total_cached_groups = sum(w.get_stats().get('total_cached_groups', 0) for w in self.channel_workers.values())
         
+        # Статистика ротации
+        total_account_reposts = sum(w.current_account_reposts for w in self.channel_workers.values())
+        active_accounts = len([w for w in self.channel_workers.values() if w.current_account])
+        
         return {
             'running': self.running,
             'uptime_seconds': uptime,
@@ -579,6 +658,10 @@ class ChannelProcessor:
             'total_errors': total_errors,
             'success_rate': (total_processed / (total_processed + total_errors) * 100) if (total_processed + total_errors) > 0 else 0,
             'messages_per_hour': (total_processed / (uptime / 3600)) if uptime > 0 else 0,
+            'rotation_stats': {
+                'total_account_reposts': total_account_reposts,
+                'active_accounts': active_accounts
+            },
             'workers': workers_stats
         }
     
@@ -624,5 +707,5 @@ class ChannelProcessor:
         self.processing_messages.clear()
 
 
-# Глобальный экземпляр - исправляем имя переменной
+# Глобальный экземпляр процессора
 channel_processor = ChannelProcessor()

@@ -1,0 +1,18 @@
+{
+    "number_reposts_before_pause": 10,
+    "pause_after_rate_reposts": 900,
+    "pause_between_reposts": 120,
+    "stop_links": [
+        "https://t.me/tribute/app?startapp=s4cB",
+        "https://t.me/tribute/app?startapp=s50u",
+        "https://t.me/tribute/app?startapp=s50v",
+        "https://t.me/tribute/app?startapp=s50w",
+        "@selskyrozum_bot"
+    ],
+    "reaction": "like",
+    "start_time": "00:13",
+    "end_time": "23:59",
+    "delay_between_reposts": 120,
+    "delay_between_groups": 60,
+    "max_groups_per_post": 20
+}

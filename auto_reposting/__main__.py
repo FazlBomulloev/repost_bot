@@ -7,7 +7,7 @@ from aiogram import Dispatcher
 from app.handlers import setup_routes
 from loguru import logger
 from telethon import TelegramClient, errors
-from telethon.errors import UserAlreadyParticipantError, FloodWaitError
+from telethon.errors import UserAlreadyParticipantError, FloodWaitError, FloodError
 from telethon.errors.rpcerrorlist import FloodWaitError as FloodWaitError2
 from telethon.events import NewMessage
 from telethon.tl.functions.channels import JoinChannelRequest
@@ -16,7 +16,7 @@ from core.models import tg_account as tg_account_db, channel as channel_db
 from auto_reposting import telegram_utils, telegram_utils2
 from auto_pause_restorer import start_pause_restorer, stop_pause_restorer, pause_restorer
 from core.settings import json_settings, bot
-from auto_reposting.channel_processor import sequential_channel_processor as channel_processor
+from auto_reposting.channel_processor import channel_processor
 from core.schemas import tg_account as tg_account_schemas
 
 log_file_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".log"
@@ -112,11 +112,12 @@ class ListenerAccountManager:
         return None, None
     
     async def handle_client_error(self, error: Exception) -> Tuple[Optional[TelegramClient], Optional[tg_account_db.TGAccount]]:
-        """Обрабатывает ошибку текущего клиента и переключается на следующий"""
+        """Обрабатывает ЛЮБУЮ ошибку текущего клиента и переключается на следующий"""
         if self.current_account:
-            logger.error(f"❌ Ошибка у аккаунта +{self.current_account.phone_number}: {error}")
+            logger.warning(f"❌ Ошибка у аккаунта +{self.current_account.phone_number}: {error}")
+            logger.info(f"🔄 Переключаюсь на следующий аккаунт из-за ошибки")
             
-            # Если это критическая ошибка авторизации - помечаем аккаунт как удаленный
+            # Только при критических ошибках авторизации помечаем как удаленный
             if isinstance(error, (errors.UnauthorizedError, errors.PhoneNumberInvalidError, errors.AuthKeyDuplicatedError)):
                 logger.warning(f"🗑️ Помечаю аккаунт +{self.current_account.phone_number} как удаленный")
                 await tg_account_db.update_tg_account(
@@ -125,6 +126,7 @@ class ListenerAccountManager:
                         status=tg_account_schemas.TGAccountStatus.deleted
                     )
                 )
+            # Для всех остальных ошибок (включая FROZEN_METHOD_INVALID, FloodWait) - просто переключаемся
         
         # Переключаемся на следующий аккаунт
         self.current_account_index += 1
@@ -138,24 +140,28 @@ def is_within_work_time(current_time, start, end):
         return current_time >= start or current_time < end
 
 
-async def check_subscribe_in_channels(client: TelegramClient) -> None:
-    channels_where_subscribed = []
+async def check_subscribe_in_channels_simple(client: TelegramClient, account: tg_account_db.TGAccount) -> None:
+    """Простая подписка на каналы - любая ошибка приводит к переключению аккаунта"""
     try:
         for channel in await channel_db.get_channels():
-            if channel.telegram_channel_id not in channels_where_subscribed:
-                try:
-                    tg_channel = await client.get_entity(channel.url)
-                    logger.info(await client(JoinChannelRequest(tg_channel)))
-                except UserAlreadyParticipantError:
-                    channels_where_subscribed.append(channel.telegram_channel_id)
-                except Exception as e:
-                    logger.exception(e)
-                    continue
-                channels_where_subscribed.append(channel.telegram_channel_id)
-
-            await asyncio.sleep(random.randint(1, 2))
+            try:
+                tg_channel = await client.get_entity(channel.url)
+                await client(JoinChannelRequest(tg_channel))
+                logger.info(f"✅ Подписался на канал {channel.url}")
+                
+            except UserAlreadyParticipantError:
+                logger.debug(f"👤 Уже подписан на {channel.url}")
+                
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка подписки на {channel.url}: {e}")
+                # Любая ошибка подписки - переключаем аккаунт
+                raise Exception(f"Subscription error for account +{account.phone_number}: {e}")
+                    
+            await asyncio.sleep(random.randint(1, 2))  # Короткая пауза между подписками
+    
     except Exception as e:
-        logger.error(f"Ошибка при подписке на каналы: {e}")
+        logger.error(f"❌ Ошибка при подписке на каналы для +{account.phone_number}: {e}")
+        raise  # Прокидываем ошибку наверх для переключения аккаунта
 
 
 async def setup_fresh_dispatcher() -> Dispatcher:
@@ -163,7 +169,24 @@ async def setup_fresh_dispatcher() -> Dispatcher:
     dp = Dispatcher()
     
     try:
-        setup_routes(dp=dp)
+        # Импортируем роутеры заново для избежания проблем с переподключением
+        import importlib
+        from app.handlers import menu, accounts, channel, settings, stats
+        
+        # Перезагружаем модули
+        importlib.reload(menu)
+        importlib.reload(accounts) 
+        importlib.reload(channel)
+        importlib.reload(settings)
+        importlib.reload(stats)
+        
+        # Подключаем роутеры к новому диспетчеру
+        dp.include_router(menu.router)
+        dp.include_router(accounts.router)
+        dp.include_router(channel.router) 
+        dp.include_router(settings.router)
+        dp.include_router(stats.router)
+        
         logger.info("✅ Роутеры успешно настроены")
         return dp
     except Exception as e:
@@ -257,27 +280,24 @@ async def main() -> None:
                     except Exception as e:
                         logger.error(f"Ошибка при добавлении сообщения в очередь: {e}")
 
-                # Подписываемся на каналы
-                await check_subscribe_in_channels(client=random_telegram_client)
+                # 🔧 ПРОСТАЯ подписка на каналы - любая ошибка = переключение аккаунта
+                try:
+                    await check_subscribe_in_channels_simple(client=random_telegram_client, account=random_tg_account)
+                    logger.success(f"✅ Успешная подписка на каналы для +{random_tg_account.phone_number}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Ошибка при подписке на каналы для +{random_tg_account.phone_number}: {e}")
+                    logger.info("🔄 Переключаюсь на следующий аккаунт")
+                    await listener_manager.handle_client_error(e)
+                    continue
 
                 # Работаем до отключения или ошибки
                 await random_telegram_client.run_until_disconnected()
                 
-            except (errors.UnauthorizedError, errors.PhoneNumberInvalidError, errors.AuthKeyDuplicatedError) as e:
-                logger.error(f"🔑 Проблемы с авторизацией аккаунта +{random_tg_account.phone_number}: {e}")
-                await listener_manager.handle_client_error(e)
-                continue
-                
-            except errors.FloodWaitError as e:
-                logger.warning(f"⏳ FloodWait для аккаунта +{random_tg_account.phone_number}: {e}")
-                # При FloodWait переключаемся на другой аккаунт
-                await listener_manager.switch_to_next_account()
-                continue
-                
             except Exception as e:
-                logger.error(f"❌ Неожиданная ошибка с аккаунтом +{random_tg_account.phone_number}: {e}")
+                logger.warning(f"❌ ЛЮБАЯ ошибка с аккаунтом +{random_tg_account.phone_number}: {e}")
+                logger.info("🔄 Переключаюсь на следующий аккаунт")
                 await listener_manager.handle_client_error(e)
-                await asyncio.sleep(10)  # Пауза перед повторной попыткой
+                await asyncio.sleep(5)  # Короткая пауза перед следующим аккаунтом
                 continue
 
         except KeyboardInterrupt:
